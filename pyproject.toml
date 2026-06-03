@@ -31,18 +31,15 @@ dependencies = [
   "rich==14.2.0",
   "safetensors==0.5.3",
   "termcolor==2.5.0",
-  "torch==2.7.1+cu128",
-  "torchcodec==0.5",
-  "torchvision==0.22.1+cu128",
+  "torch==2.8.0",
+  "torchcodec==0.7",
+  "torchvision==0.23.0",
   "tqdm==4.66.5",
   "transformers==4.49.0",
   "typing-extensions==4.15.0",
   "wandb==0.23.1",
 ]
 
-[tool.setuptools.package-dir]
-"" = "src"
-
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
 include = ["fastwam*"]
