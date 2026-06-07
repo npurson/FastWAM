@@ -55,6 +55,10 @@ class Wan22Trainer:
                 "Expected one of: ['no', 'fp16', 'bf16']."
             )
         self.wandb_enabled = bool(cfg.wandb.enabled)
+        tensorboard_cfg = cfg.get("tensorboard", None)
+        self.tensorboard_enabled = bool(
+            tensorboard_cfg is not None and tensorboard_cfg.get("enabled", False)
+        )
 
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -122,7 +126,9 @@ class Wan22Trainer:
         )
         self.optimizer.zero_grad(set_to_none=True)
         self.wandb_run = None
+        self.tensorboard_writer = None
         self._init_wandb()
+        self._init_tensorboard()
         self._resume_or_load_checkpoint()
 
         val_size = len(self.val_dataset) if self.val_dataset is not None else len(self.train_dataset)
@@ -163,6 +169,46 @@ class Wan22Trainer:
             return
         self.wandb_run.finish()
         self.wandb_run = None
+
+    def _init_tensorboard(self):
+        if not self.tensorboard_enabled or not self.accelerator.is_main_process:
+            return
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError as e:
+            raise ImportError(
+                "TensorBoard logging is enabled in config (`tensorboard.enabled=true`) "
+                "but tensorboard is not installed."
+            ) from e
+
+        tb_cfg = self.cfg.tensorboard
+        log_dir = tb_cfg.get("log_dir", None)
+        if log_dir in (None, "null", ""):
+            log_dir = os.path.join(self.output_dir, "tensorboard")
+        self.tensorboard_writer = SummaryWriter(log_dir=str(log_dir))
+        logger.info("Initialized tensorboard writer: log_dir=%s", log_dir)
+
+    def _tensorboard_log(self, payload: dict):
+        if self.tensorboard_writer is None:
+            return
+        for key, value in payload.items():
+            if isinstance(value, (int, float, np.integer, np.floating)):
+                self.tensorboard_writer.add_scalar(key, float(value), self.global_step)
+        self.tensorboard_writer.flush()
+
+    def _tensorboard_log_video(self, tag: str, video: torch.Tensor, fps: int = 8):
+        if self.tensorboard_writer is None:
+            return
+        video = video.detach().float().cpu().clamp(0.0, 1.0)
+        video = video.permute(1, 0, 2, 3).unsqueeze(0).contiguous()
+        self.tensorboard_writer.add_video(tag, video, self.global_step, fps=fps)
+        self.tensorboard_writer.flush()
+
+    def _finish_tensorboard(self):
+        if self.tensorboard_writer is None:
+            return
+        self.tensorboard_writer.close()
+        self.tensorboard_writer = None
 
     def _build_loader(self, dataset, worker_init_fn=None):
         self.train_sampler = ResumableEpochSampler(
@@ -514,16 +560,18 @@ class Wan22Trainer:
             [pred_video_tensor, vae_video_tensor, gt_video_tensor],
             dim=2,
         ).contiguous()
-        stitched_frames = []
-        for t in range(stitched_video_tensor.shape[1]):
-            frame = (stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
-            stitched_frames.append(Image.fromarray(frame))
+        video_path = None
+        if self.accelerator.is_main_process:
+            stitched_frames = []
+            for t in range(stitched_video_tensor.shape[1]):
+                frame = (stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
+                stitched_frames.append(Image.fromarray(frame))
 
-        video_path = os.path.join(
-            self.eval_dir,
-            f"step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}.mp4",
-        )
-        save_mp4(stitched_frames, video_path, fps=8)
+            video_path = os.path.join(
+                self.eval_dir,
+                f"step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}.mp4",
+            )
+            save_mp4(stitched_frames, video_path, fps=8)
 
         local_metrics = torch.tensor(
             [
@@ -557,6 +605,7 @@ class Wan22Trainer:
             "psnr_dg": float(mean_metrics[5].item()),
             "ssim_dg": float(mean_metrics[6].item()),
             "video_path": video_path,
+            "video_tensor": stitched_video_tensor,
         }
         if action_l2_mean is not None:
             result["action_l2"] = float(action_l2_mean)
@@ -724,6 +773,7 @@ class Wan22Trainer:
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
                         self._wandb_log(wandb_payload)
+                        self._tensorboard_log(wandb_payload)
 
                     if (
                         self.eval_every > 0
@@ -758,6 +808,9 @@ class Wan22Trainer:
                             if "action_l1" in metrics:
                                 eval_payload["eval/action_l1"] = float(metrics["action_l1"])
                             self._wandb_log(eval_payload)
+                            self._tensorboard_log(eval_payload)
+                            if "video_tensor" in metrics:
+                                self._tensorboard_log_video("eval/pred_vae_gt", metrics["video_tensor"], fps=8)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:
                         ckpt_info = self.save_checkpoint()
@@ -778,6 +831,8 @@ class Wan22Trainer:
                                 ckpt_info["weights_path"],
                                 ckpt_info["state_path"],
                             )
+                            self._finish_wandb()
+                            self._finish_tensorboard()
                         return
 
         ckpt_info = self.save_checkpoint()
@@ -788,4 +843,6 @@ class Wan22Trainer:
                 ckpt_info["weights_path"],
                 ckpt_info["state_path"],
             )
+            self._finish_wandb()
+            self._finish_tensorboard()
         

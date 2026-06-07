@@ -7,10 +7,12 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import hydra
+import torch.distributed as dist
 import yaml
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig
@@ -62,6 +64,14 @@ def _is_blocked_override(raw_override: str) -> bool:
 
 def _collect_worker_overrides() -> list[str]:
     return [ov for ov in HydraConfig.get().overrides.task if not _is_blocked_override(ov)]
+
+
+def _has_task_override(key: str) -> bool:
+    for raw_override in HydraConfig.get().overrides.task:
+        raw_key = raw_override.split("=", 1)[0].lstrip("+~")
+        if raw_key == key:
+            return True
+    return False
 
 
 def _load_all_tasks() -> list[str]:
@@ -122,6 +132,120 @@ def _to_jsonable(value: float | None) -> float | None:
     return float(value)
 
 
+def _write_summary_files(
+    *,
+    tasks: list[str],
+    task_rates: dict[str, dict[str, float | None]],
+    summary_csv: Path,
+    summary_json: Path,
+) -> None:
+    clean_mean = _mean_or_none([task_rates[t]["clean"] for t in tasks])
+    random_mean = _mean_or_none([task_rates[t]["random"] for t in tasks])
+
+    with summary_csv.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["task_name", "clean_success_rate", "random_success_rate"])
+        for task in tasks:
+            writer.writerow(
+                [
+                    task,
+                    task_rates[task]["clean"],
+                    task_rates[task]["random"],
+                ]
+            )
+        writer.writerow(["__overall__", clean_mean, random_mean])
+
+    payload = {
+        "per_task": [
+            {
+                "task_name": task,
+                "clean_success_rate": _to_jsonable(task_rates[task]["clean"]),
+                "random_success_rate": _to_jsonable(task_rates[task]["random"]),
+            }
+            for task in tasks
+        ],
+        "overall": {
+            "clean_mean_success_rate": _to_jsonable(clean_mean),
+            "random_mean_success_rate": _to_jsonable(random_mean),
+        },
+    }
+    summary_json.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _write_failed_records(failed_tasks_file: Path, failed_records: list[dict[str, Any]]) -> None:
+    with failed_tasks_file.open("w", encoding="utf-8") as f:
+        for rec in failed_records:
+            f.write(
+                f"{rec['task_name']},{rec['phase']},gpu={rec['gpu_id']},"
+                f"return_code={rec['return_code']},reason={rec['reason']}\n"
+            )
+
+
+def _cfg_or_env(cfg: DictConfig, key: str, env_key: str, default: Any) -> Any:
+    value = cfg.MULTIRUN.get(key)
+    if value is not None:
+        return value
+    return os.environ.get(env_key, default)
+
+
+def _sync_multinode_status(
+    *,
+    master_addr: str,
+    master_port: int,
+    num_nodes: int,
+    node_rank: int,
+    timeout_s: int,
+    has_failure: bool,
+    failure_message: str,
+) -> list[dict[str, Any]]:
+    store = dist.TCPStore(
+        host_name=master_addr,
+        port=master_port,
+        world_size=num_nodes,
+        is_master=(node_rank == 0),
+        timeout=timedelta(seconds=timeout_s),
+    )
+    key = f"robotwin_eval_status::{node_rank}"
+    store.set(
+        key,
+        json.dumps(
+            {
+                "node_rank": node_rank,
+                "has_failure": bool(has_failure),
+                "failure_message": str(failure_message),
+            },
+            ensure_ascii=True,
+        ),
+    )
+    statuses = []
+    for rank in range(num_nodes):
+        payload = store.get(f"robotwin_eval_status::{rank}").decode("utf-8")
+        statuses.append(json.loads(payload))
+
+    # TCPStore's master lives in the rank-0 process. Keep rank 0 alive until
+    # every rank has finished reading the shared statuses, otherwise slower
+    # ranks can see connection-reset errors while still inside store.get().
+    read_ack_key = f"robotwin_eval_status_read_ack::{node_rank}"
+    store.set(read_ack_key, "1")
+    if node_rank == 0:
+        for rank in range(num_nodes):
+            store.get(f"robotwin_eval_status_read_ack::{rank}")
+        store.set("robotwin_eval_status_release", "1")
+
+    store.get("robotwin_eval_status_release")
+
+    release_ack_key = f"robotwin_eval_status_release_ack::{node_rank}"
+    store.set(release_ack_key, "1")
+    if node_rank == 0:
+        for rank in range(num_nodes):
+            store.get(f"robotwin_eval_status_release_ack::{rank}")
+
+    return statuses
+
+
 @dataclass
 class RunningState:
     task_name: str
@@ -152,6 +276,20 @@ def main(cfg: DictConfig):
     max_tasks_per_gpu = int(cfg.MULTIRUN.max_tasks_per_gpu)
     if max_tasks_per_gpu <= 0:
         raise ValueError("`MULTIRUN.max_tasks_per_gpu` must be > 0.")
+    num_nodes = int(_cfg_or_env(cfg, "num_nodes", "NNODES", 1))
+    node_rank = int(_cfg_or_env(cfg, "node_rank", "NODE_RANK", 0))
+    if num_nodes <= 0:
+        raise ValueError("`MULTIRUN.num_nodes` must be > 0.")
+    if node_rank < 0 or node_rank >= num_nodes:
+        raise ValueError(f"`MULTIRUN.node_rank` must be in [0, {num_nodes}), got {node_rank}.")
+    if num_nodes > 1 and not _has_task_override("EVALUATION.output_dir"):
+        raise ValueError(
+            "Multi-node RoboTwin eval requires an explicit shared `EVALUATION.output_dir`. "
+            "Pass the same value on every node so all workers write into one run directory."
+        )
+    master_addr = str(_cfg_or_env(cfg, "master_addr", "MASTER_ADDR", "127.0.0.1"))
+    master_port = int(_cfg_or_env(cfg, "master_port", "EVAL_MASTER_PORT", 29523))
+    barrier_timeout_s = int(_cfg_or_env(cfg, "barrier_timeout_s", "EVAL_BARRIER_TIMEOUT", 3600))
     gpu_ids = list(range(num_gpus))
 
     output_dir = _resolve_path(str(cfg.EVALUATION.output_dir), base=PROJECT_ROOT)
@@ -161,16 +299,20 @@ def main(cfg: DictConfig):
     run_output_dir = PROJECT_ROOT / "evaluate_results" / "robotwin" / ckpt_tag / run_ts
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
-    manager_log = run_output_dir / "manager.log"
-    failed_tasks_file = run_output_dir / "failed_tasks.txt"
-    summary_csv = run_output_dir / "summary.csv"
-    summary_json = run_output_dir / "summary.json"
+    manager_log = run_output_dir / f"manager_node_{node_rank}.log"
+    failed_tasks_file = run_output_dir / f"failed_tasks_node_{node_rank}.txt"
+    summary_csv = run_output_dir / f"summary_node_{node_rank}.csv"
+    summary_json = run_output_dir / f"summary_node_{node_rank}.json"
+    final_failed_tasks_file = run_output_dir / "failed_tasks.txt"
+    final_summary_csv = run_output_dir / "summary.csv"
+    final_summary_json = run_output_dir / "summary.json"
 
     task_name_cfg = cfg.EVALUATION.task_name
     if task_name_cfg is None or str(task_name_cfg).strip() == "":
-        tasks = _load_all_tasks()
+        all_tasks = _load_all_tasks()
     else:
-        tasks = [str(task_name_cfg)]
+        all_tasks = [str(task_name_cfg)]
+    tasks = [task for idx, task in enumerate(all_tasks) if idx % num_nodes == node_rank]
 
     extra_overrides = _collect_worker_overrides()
 
@@ -258,51 +400,50 @@ def main(cfg: DictConfig):
             running_states.append(launch_phase(task_name=task_name, gpu_id=gpu_id, phase="clean"))
 
     def write_outputs() -> None:
-        clean_mean = _mean_or_none([task_rates[t]["clean"] for t in tasks])
-        random_mean = _mean_or_none([task_rates[t]["random"] for t in tasks])
-
-        with summary_csv.open("w", encoding="utf-8", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["task_name", "clean_success_rate", "random_success_rate"])
-            for task in tasks:
-                writer.writerow(
-                    [
-                        task,
-                        task_rates[task]["clean"],
-                        task_rates[task]["random"],
-                    ]
-                )
-            writer.writerow(["__overall__", clean_mean, random_mean])
-
-        payload = {
-            "per_task": [
-                {
-                    "task_name": task,
-                    "clean_success_rate": _to_jsonable(task_rates[task]["clean"]),
-                    "random_success_rate": _to_jsonable(task_rates[task]["random"]),
-                }
-                for task in tasks
-            ],
-            "overall": {
-                "clean_mean_success_rate": _to_jsonable(clean_mean),
-                "random_mean_success_rate": _to_jsonable(random_mean),
-            },
-        }
-        summary_json.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        _write_summary_files(
+            tasks=tasks,
+            task_rates=task_rates,
+            summary_csv=summary_csv,
+            summary_json=summary_json,
         )
+        _write_failed_records(failed_tasks_file, failed_records)
 
-        with failed_tasks_file.open("w", encoding="utf-8") as f:
-            for rec in failed_records:
-                f.write(
-                    f"{rec['task_name']},{rec['phase']},gpu={rec['gpu_id']},"
-                    f"return_code={rec['return_code']},reason={rec['reason']}\n"
-                )
+    def write_final_outputs() -> None:
+        final_task_rates: dict[str, dict[str, float | None]] = {}
+        final_failed_records: list[dict[str, Any]] = []
+
+        for task in all_tasks:
+            final_task_rates[task] = {"clean": None, "random": None}
+            for phase in ("clean", "random"):
+                result_file = run_output_dir / task / _phase_result_filename(phase)
+                try:
+                    final_task_rates[task][phase] = _parse_success_rate(result_file)
+                except Exception as exc:
+                    final_failed_records.append(
+                        {
+                            "task_name": task,
+                            "phase": phase,
+                            "gpu_id": -1,
+                            "return_code": -1,
+                            "reason": f"final_result_parse_failed:{repr(exc)}",
+                        }
+                    )
+
+        _write_summary_files(
+            tasks=all_tasks,
+            task_rates=final_task_rates,
+            summary_csv=final_summary_csv,
+            summary_json=final_summary_json,
+        )
+        _write_failed_records(final_failed_tasks_file, final_failed_records)
+
+        if final_failed_records:
+            raise RuntimeError(f"final summary has {len(final_failed_records)} missing or invalid results")
 
     log(
-        f"manager start tasks={len(tasks)} gpu_ids={gpu_ids} "
-        f"max_tasks_per_gpu={max_tasks_per_gpu} output_dir={run_output_dir}"
+        f"manager start node_rank={node_rank}/{num_nodes} local_tasks={len(tasks)} "
+        f"all_tasks={len(all_tasks)} gpu_ids={gpu_ids} max_tasks_per_gpu={max_tasks_per_gpu} "
+        f"output_dir={run_output_dir}"
     )
 
     # Launch initial tasks for each GPU up to capacity.
@@ -400,10 +541,51 @@ def main(cfg: DictConfig):
             )
 
     write_outputs()
-    log(f"summary saved: {summary_csv} and {summary_json}")
+    log(f"node summary saved: {summary_csv} and {summary_json}")
 
-    if has_failure:
-        raise RuntimeError(failure_message)
+    statuses = [
+        {
+            "node_rank": node_rank,
+            "has_failure": has_failure,
+            "failure_message": failure_message,
+        }
+    ]
+    if num_nodes > 1:
+        log(
+            f"waiting for multinode eval barrier addr={master_addr} "
+            f"port={master_port} timeout_s={barrier_timeout_s}"
+        )
+        statuses = _sync_multinode_status(
+            master_addr=master_addr,
+            master_port=master_port,
+            num_nodes=num_nodes,
+            node_rank=node_rank,
+            timeout_s=barrier_timeout_s,
+            has_failure=has_failure,
+            failure_message=failure_message,
+        )
+        log("multinode eval barrier passed")
+
+    failed_statuses = [status for status in statuses if status.get("has_failure")]
+    if node_rank == 0:
+        if failed_statuses:
+            with final_failed_tasks_file.open("w", encoding="utf-8") as f:
+                for status in failed_statuses:
+                    f.write(
+                        f"node_rank={status.get('node_rank')},"
+                        f"reason={status.get('failure_message')}\n"
+                    )
+        else:
+            write_final_outputs()
+            log(f"final summary saved: {final_summary_csv} and {final_summary_json}")
+
+    if failed_statuses:
+        raise RuntimeError(
+            "; ".join(
+                f"node {status.get('node_rank')}: {status.get('failure_message')}"
+                for status in failed_statuses
+            )
+        )
 
     log("manager finished successfully")
 
