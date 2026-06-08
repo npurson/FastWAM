@@ -91,7 +91,7 @@ def create_fastwam(
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
-    from .models.wan22.fastwam import FastWAM
+    from .models.fastwam import FastWAM
 
     if isinstance(video_dit_config, DictConfig):
         video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
@@ -176,7 +176,7 @@ def create_fastwam_joint(
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
-    from .models.wan22.fastwam_joint import FastWAMJoint
+    from .models.fastwam_joint import FastWAMJoint
 
     if isinstance(video_dit_config, DictConfig):
         video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
@@ -261,7 +261,7 @@ def create_fastwam_idm(
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
-    from .models.wan22.fastwam_idm import (
+    from .models.fastwam_idm import (
         FastWAMIDM,
     )
 

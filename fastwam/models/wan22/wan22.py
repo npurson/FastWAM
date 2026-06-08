@@ -5,8 +5,8 @@ import torch.nn.functional as F
 from PIL import Image
 from typing import Any, Optional, Sequence, Union
 
-from .helpers.loader import load_wan22_ti2v_5b_components
-from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
+from ..helpers.loader import load_wan22_ti2v_5b_components
+from ..schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 from .wan_video_dit import WanVideoDiT
 
 

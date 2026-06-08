@@ -14,7 +14,7 @@ from omegaconf import DictConfig, ListConfig
 from tqdm import tqdm
 
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
-from fastwam.models.wan22.helpers.loader import _load_registered_model, _resolve_configs
+from fastwam.models.helpers.loader import _load_registered_model, _resolve_configs
 from fastwam.models.wan22.wan_video_text_encoder import HuggingfaceTokenizer
 from fastwam.utils.config_resolvers import register_default_resolvers
 from fastwam.utils.logging_config import get_logger, setup_logging

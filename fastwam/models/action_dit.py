@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 from fastwam.utils.logging_config import get_logger
 
 from .helpers.gradient import gradient_checkpoint_forward
-from .wan_video_dit import (
+from .wan22.wan_video_dit import (
     DiTBlock,
     sinusoidal_embedding_1d,
     precompute_freqs_cis,

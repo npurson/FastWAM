@@ -9,9 +9,9 @@ from .io import ModelConfig, hash_model_file, load_state_dict
 from .state_dict_converters import (
     wan_video_vae_state_dict_converter,
 )
-from ..wan_video_dit import WanVideoDiT
-from ..wan_video_text_encoder import HuggingfaceTokenizer, WanTextEncoder
-from ..wan_video_vae import WanVideoVAE38
+from ..wan22.wan_video_dit import WanVideoDiT
+from ..wan22.wan_video_text_encoder import HuggingfaceTokenizer, WanTextEncoder
+from ..wan22.wan_video_vae import WanVideoVAE38
 from fastwam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)

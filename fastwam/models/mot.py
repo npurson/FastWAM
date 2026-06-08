@@ -5,7 +5,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 
-from .wan_video_dit import flash_attention, modulate, rope_apply
+from .wan22.wan_video_dit import flash_attention, modulate, rope_apply
 from fastwam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
