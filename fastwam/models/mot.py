@@ -451,6 +451,7 @@ class MoT(nn.Module):
         freqs_all: Dict[str, torch.Tensor],
         context_all: Dict[str, Optional[dict]],
         t_mod_all: Dict[str, torch.Tensor],
+        return_intermediate_layers: Optional[set[int]] = None,
     ):
         missing = [k for k in self.expert_order if k not in embeds_all]
         if missing:
@@ -468,6 +469,8 @@ class MoT(nn.Module):
             raise ValueError(f"`attention_mask` must be square, got shape {tuple(attention_mask.shape)}")
 
         tokens_all = {k: v for k, v in embeds_all.items()}
+        intermediate_tokens: dict[int, dict[str, torch.Tensor]] = {}
+        collect_layers = set(return_intermediate_layers or [])
 
         for layer_idx in range(self.num_layers):
             q_chunks = []
@@ -553,4 +556,9 @@ class MoT(nn.Module):
                 tokens_all[name] = updated_tokens
                 start = end
 
+            if layer_idx in collect_layers:
+                intermediate_tokens[layer_idx] = {k: v for k, v in tokens_all.items()}
+
+        if return_intermediate_layers is not None:
+            return tokens_all, intermediate_tokens
         return tokens_all

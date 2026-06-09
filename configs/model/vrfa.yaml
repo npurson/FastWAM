@@ -1,0 +1,72 @@
+defaults:
+  - fastwam
+  - _self_
+
+_target_: fastwam.runtime.create_vrfa
+
+representation_forcing:
+  enabled: true
+  mode: repa
+  layer_indices: [15]
+  projector_hidden_dim: ${model.video_dit_config.hidden_dim}
+  loss_weight: 0.1
+  normalize_target: false
+  detach_alignment_input: false
+  # Online teacher acceleration: use one anchor frame per WAN latent-time chunk.
+  # For RobotWin's 9 video frames and 3 WAN latent frames this selects [0, 3, 7].
+  target_temporal_sampling: latent_anchor_center
+  ## Geometric forcing
+  # mode: gf
+  # angular_weight: 1.0
+  # scale_weight: 1.0
+
+  ## ReDi
+  # mode: redi
+  # loss_weight: 0.2
+  # redi_drop_prob: 0.0
+  # redi_condition_first_frame: false
+
+  # pca:
+  #   enabled: false
+  #   dim: 16
+  #   stats_path: null
+  #   fit_on_the_fly: false
+
+  encoder:
+    name: vggt
+    camera_layout: robotwin
+    num_cameras: 3
+    model_id: facebook/VGGT-1B
+    input_size: [224, 280]
+    output_dim: 2048
+
+  ## DINO
+  # encoder:
+  #   name: dino
+  #   backend: hub
+  #   hub_repo: facebookresearch/dinov3
+  #   hub_source: github
+  #   model_name: dinov3_vitb16
+  #   model_id: facebook/dinov3-vitb16-pretrain-lvd1689m
+  #   hub_kwargs: {}
+  #   input_size: [512, 512]
+  #   output_dim: 768
+  #   camera_layout: robotwin
+  #   num_cameras: 3
+
+  ## V-JEPA
+  # encoder:
+  #   name: vjepa
+  #   backend: hub
+  #   hub_repo: facebookresearch/vjepa2
+  #   hub_model_name: vjepa2_1_vit_large_384
+  #   model_id: ""
+  #   hub_source: github
+  #   hub_kwargs: {}
+  #   input_layout: bcthw
+  #   input_size: [384, 384]
+  #   frames_per_clip: 64
+  #   patch_size: 16
+  #   output_dim: 1024
+  #   camera_layout: robotwin
+  #   num_cameras: 3

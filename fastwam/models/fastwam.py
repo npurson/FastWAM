@@ -111,6 +111,7 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        **model_kwargs,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
@@ -168,6 +169,7 @@ class FastWAM(torch.nn.Module):
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            **model_kwargs,
         )
         model.model_paths = {
             "video_dit": components.dit_path,
@@ -274,7 +276,7 @@ class FastWAM(torch.nn.Module):
             frames.append(Image.fromarray(frame))
         return frames
 
-    def build_inputs(self, sample, tiled: bool = False):
+    def build_inputs(self, sample, tiled: bool = False, return_input_video: bool = False):
         video = sample["video"]
         if "context" not in sample or "context_mask" not in sample:
             raise ValueError(
@@ -371,7 +373,7 @@ class FastWAM(torch.nn.Module):
         if image_is_pad is not None:
             image_is_pad = image_is_pad.to(device=self.device, dtype=torch.bool, non_blocking=True)
 
-        return {
+        inputs = {
             "context": context,
             "context_mask": context_mask,
             "input_latents": input_latents,
@@ -381,6 +383,9 @@ class FastWAM(torch.nn.Module):
             "action_is_pad": action_is_pad,
             "image_is_pad": image_is_pad,
         }
+        if return_input_video:
+            inputs["input_video"] = input_video
+        return inputs
 
     @torch.no_grad()
     def _build_mot_attention_mask(

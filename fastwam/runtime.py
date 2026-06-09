@@ -73,6 +73,80 @@ def create_wan22_model(
     )
 
 
+def _as_resolved_dict(value, name: str, *, default=None, required: bool = False):
+    if isinstance(value, DictConfig):
+        value = OmegaConf.to_container(value, resolve=True)
+    if value is None:
+        if required:
+            raise ValueError(f"`{name}` is required.")
+        value = {} if default is None else default
+    if not isinstance(value, dict):
+        raise ValueError(f"`{name}` must resolve to a dict, got {type(value)}")
+    return value
+
+
+def _validate_action_scheduler(action_scheduler: dict, model_name: str):
+    required_keys = {"train_shift", "infer_shift", "num_train_timesteps"}
+    missing_keys = required_keys - set(action_scheduler.keys())
+    if missing_keys:
+        raise ValueError(
+            f"`action_scheduler` missing required keys for {model_name}: {sorted(missing_keys)}. "
+            "Expected keys: train_shift, infer_shift, num_train_timesteps."
+        )
+
+
+def _fastwam_pretrained_kwargs(
+    *,
+    model_id: str,
+    tokenizer_model_id: str,
+    video_dit_config,
+    tokenizer_max_len: int,
+    load_text_encoder: bool,
+    proprio_dim: int | None,
+    action_dit_config,
+    action_dit_pretrained_path: str | None,
+    skip_dit_load_from_pretrain: bool,
+    video_scheduler,
+    action_scheduler,
+    loss,
+    mot_checkpoint_mixed_attn: bool,
+    redirect_common_files: bool,
+    model_dtype: torch.dtype,
+    device: str,
+    model_name: str,
+):
+    video_dit_config = _as_resolved_dict(video_dit_config, "video_dit_config", required=True)
+    action_dit_config = _as_resolved_dict(action_dit_config, "action_dit_config")
+    video_scheduler = _as_resolved_dict(video_scheduler, "video_scheduler")
+    action_scheduler = _as_resolved_dict(action_scheduler, "action_scheduler", required=True)
+    loss = _as_resolved_dict(loss, "loss")
+    _validate_action_scheduler(action_scheduler, model_name)
+
+    return {
+        "device": device,
+        "torch_dtype": model_dtype,
+        "model_id": model_id,
+        "tokenizer_model_id": tokenizer_model_id,
+        "tokenizer_max_len": int(tokenizer_max_len),
+        "load_text_encoder": bool(load_text_encoder),
+        "proprio_dim": None if proprio_dim is None else int(proprio_dim),
+        "redirect_common_files": bool(redirect_common_files),
+        "video_dit_config": video_dit_config,
+        "action_dit_config": action_dit_config,
+        "action_dit_pretrained_path": action_dit_pretrained_path,
+        "skip_dit_load_from_pretrain": bool(skip_dit_load_from_pretrain),
+        "mot_checkpoint_mixed_attn": bool(mot_checkpoint_mixed_attn),
+        "video_train_shift": float(video_scheduler.get("train_shift", 5.0)),
+        "video_infer_shift": float(video_scheduler.get("infer_shift", 5.0)),
+        "video_num_train_timesteps": int(video_scheduler.get("num_train_timesteps", 1000)),
+        "action_train_shift": float(action_scheduler["train_shift"]),
+        "action_infer_shift": float(action_scheduler["infer_shift"]),
+        "action_num_train_timesteps": int(action_scheduler["num_train_timesteps"]),
+        "loss_lambda_video": float(loss.get("lambda_video", 1.0)),
+        "loss_lambda_action": float(loss.get("lambda_action", 1.0)),
+    }
+
+
 def create_fastwam(
     model_id: str,
     tokenizer_model_id: str,
@@ -93,68 +167,73 @@ def create_fastwam(
 ):
     from .models.fastwam import FastWAM
 
-    if isinstance(video_dit_config, DictConfig):
-        video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
-    if not isinstance(video_dit_config, dict):
-        raise ValueError(f"`video_dit_config` must resolve to a dict, got {type(video_dit_config)}")
-
-    if isinstance(action_dit_config, DictConfig):
-        action_dit_config = OmegaConf.to_container(action_dit_config, resolve=True)
-    if action_dit_config is None:
-        action_dit_config = {}
-    if not isinstance(action_dit_config, dict):
-        raise ValueError(f"`action_dit_config` must resolve to a dict, got {type(action_dit_config)}")
-
-    if isinstance(video_scheduler, DictConfig):
-        video_scheduler = OmegaConf.to_container(video_scheduler, resolve=True)
-    if video_scheduler is None:
-        video_scheduler = {}
-    if not isinstance(video_scheduler, dict):
-        raise ValueError(f"`video_scheduler` must be dict-like, got {type(video_scheduler)}")
-
-    if isinstance(action_scheduler, DictConfig):
-        action_scheduler = OmegaConf.to_container(action_scheduler, resolve=True)
-    if action_scheduler is None:
-        raise ValueError("`action_scheduler` is required for FastWAM.")
-    if not isinstance(action_scheduler, dict):
-        raise ValueError(f"`action_scheduler` must be dict-like, got {type(action_scheduler)}")
-    required_action_scheduler_keys = {"train_shift", "infer_shift", "num_train_timesteps"}
-    missing_keys = required_action_scheduler_keys - set(action_scheduler.keys())
-    if missing_keys:
-        raise ValueError(
-            f"`action_scheduler` missing required keys: {sorted(missing_keys)}. "
-            "Expected keys: train_shift, infer_shift, num_train_timesteps."
-        )
-
-    if isinstance(loss, DictConfig):
-        loss = OmegaConf.to_container(loss, resolve=True)
-    if loss is None:
-        loss = {}
-    if not isinstance(loss, dict):
-        raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
-
     return FastWAM.from_wan22_pretrained(
-        device=device,
-        torch_dtype=model_dtype,
-        model_id=model_id,
-        tokenizer_model_id=tokenizer_model_id,
-        tokenizer_max_len=int(tokenizer_max_len),
-        load_text_encoder=bool(load_text_encoder),
-        proprio_dim=(None if proprio_dim is None else int(proprio_dim)),
-        redirect_common_files=bool(redirect_common_files),
-        video_dit_config=video_dit_config,
-        action_dit_config=action_dit_config,
-        action_dit_pretrained_path=action_dit_pretrained_path,
-        skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
-        mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
-        video_train_shift=float(video_scheduler.get("train_shift", 5.0)),
-        video_infer_shift=float(video_scheduler.get("infer_shift", 5.0)),
-        video_num_train_timesteps=int(video_scheduler.get("num_train_timesteps", 1000)),
-        action_train_shift=float(action_scheduler["train_shift"]),
-        action_infer_shift=float(action_scheduler["infer_shift"]),
-        action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
-        loss_lambda_video=float(loss.get("lambda_video", 1.0)),
-        loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        **_fastwam_pretrained_kwargs(
+            model_id=model_id,
+            tokenizer_model_id=tokenizer_model_id,
+            video_dit_config=video_dit_config,
+            tokenizer_max_len=tokenizer_max_len,
+            load_text_encoder=load_text_encoder,
+            proprio_dim=proprio_dim,
+            action_dit_config=action_dit_config,
+            action_dit_pretrained_path=action_dit_pretrained_path,
+            skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
+            video_scheduler=video_scheduler,
+            action_scheduler=action_scheduler,
+            loss=loss,
+            mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
+            redirect_common_files=redirect_common_files,
+            model_dtype=model_dtype,
+            device=device,
+            model_name="FastWAM",
+        )
+    )
+
+
+def create_vrfa(
+    model_id: str,
+    tokenizer_model_id: str,
+    video_dit_config,
+    tokenizer_max_len: int = 512,
+    load_text_encoder: bool = True,
+    proprio_dim: int | None = None,
+    action_dit_config=None,
+    action_dit_pretrained_path: str | None = None,
+    skip_dit_load_from_pretrain: bool = False,
+    video_scheduler=None,
+    action_scheduler=None,
+    loss=None,
+    representation_forcing=None,
+    mot_checkpoint_mixed_attn: bool = True,
+    redirect_common_files: bool = True,
+    model_dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    from .models.vrfa import VrfA
+
+    representation_forcing = _as_resolved_dict(representation_forcing, "representation_forcing")
+
+    return VrfA.from_wan22_pretrained(
+        **_fastwam_pretrained_kwargs(
+            model_id=model_id,
+            tokenizer_model_id=tokenizer_model_id,
+            video_dit_config=video_dit_config,
+            tokenizer_max_len=tokenizer_max_len,
+            load_text_encoder=load_text_encoder,
+            proprio_dim=proprio_dim,
+            action_dit_config=action_dit_config,
+            action_dit_pretrained_path=action_dit_pretrained_path,
+            skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
+            video_scheduler=video_scheduler,
+            action_scheduler=action_scheduler,
+            loss=loss,
+            mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
+            redirect_common_files=redirect_common_files,
+            model_dtype=model_dtype,
+            device=device,
+            model_name="VrfA",
+        ),
+        representation_forcing=representation_forcing,
     )
 
 
@@ -178,68 +257,26 @@ def create_fastwam_joint(
 ):
     from .models.fastwam_joint import FastWAMJoint
 
-    if isinstance(video_dit_config, DictConfig):
-        video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
-    if not isinstance(video_dit_config, dict):
-        raise ValueError(f"`video_dit_config` must resolve to a dict, got {type(video_dit_config)}")
-
-    if isinstance(action_dit_config, DictConfig):
-        action_dit_config = OmegaConf.to_container(action_dit_config, resolve=True)
-    if action_dit_config is None:
-        action_dit_config = {}
-    if not isinstance(action_dit_config, dict):
-        raise ValueError(f"`action_dit_config` must resolve to a dict, got {type(action_dit_config)}")
-
-    if isinstance(video_scheduler, DictConfig):
-        video_scheduler = OmegaConf.to_container(video_scheduler, resolve=True)
-    if video_scheduler is None:
-        video_scheduler = {}
-    if not isinstance(video_scheduler, dict):
-        raise ValueError(f"`video_scheduler` must be dict-like, got {type(video_scheduler)}")
-
-    if isinstance(action_scheduler, DictConfig):
-        action_scheduler = OmegaConf.to_container(action_scheduler, resolve=True)
-    if action_scheduler is None:
-        raise ValueError("`action_scheduler` is required for FastWAM.")
-    if not isinstance(action_scheduler, dict):
-        raise ValueError(f"`action_scheduler` must be dict-like, got {type(action_scheduler)}")
-    required_action_scheduler_keys = {"train_shift", "infer_shift", "num_train_timesteps"}
-    missing_keys = required_action_scheduler_keys - set(action_scheduler.keys())
-    if missing_keys:
-        raise ValueError(
-            f"`action_scheduler` missing required keys: {sorted(missing_keys)}. "
-            "Expected keys: train_shift, infer_shift, num_train_timesteps."
-        )
-
-    if isinstance(loss, DictConfig):
-        loss = OmegaConf.to_container(loss, resolve=True)
-    if loss is None:
-        loss = {}
-    if not isinstance(loss, dict):
-        raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
-
     return FastWAMJoint.from_wan22_pretrained(
-        device=device,
-        torch_dtype=model_dtype,
-        model_id=model_id,
-        tokenizer_model_id=tokenizer_model_id,
-        tokenizer_max_len=int(tokenizer_max_len),
-        load_text_encoder=bool(load_text_encoder),
-        proprio_dim=(None if proprio_dim is None else int(proprio_dim)),
-        redirect_common_files=bool(redirect_common_files),
-        video_dit_config=video_dit_config,
-        action_dit_config=action_dit_config,
-        action_dit_pretrained_path=action_dit_pretrained_path,
-        skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
-        mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
-        video_train_shift=float(video_scheduler.get("train_shift", 5.0)),
-        video_infer_shift=float(video_scheduler.get("infer_shift", 5.0)),
-        video_num_train_timesteps=int(video_scheduler.get("num_train_timesteps", 1000)),
-        action_train_shift=float(action_scheduler["train_shift"]),
-        action_infer_shift=float(action_scheduler["infer_shift"]),
-        action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
-        loss_lambda_video=float(loss.get("lambda_video", 1.0)),
-        loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        **_fastwam_pretrained_kwargs(
+            model_id=model_id,
+            tokenizer_model_id=tokenizer_model_id,
+            video_dit_config=video_dit_config,
+            tokenizer_max_len=tokenizer_max_len,
+            load_text_encoder=load_text_encoder,
+            proprio_dim=proprio_dim,
+            action_dit_config=action_dit_config,
+            action_dit_pretrained_path=action_dit_pretrained_path,
+            skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
+            video_scheduler=video_scheduler,
+            action_scheduler=action_scheduler,
+            loss=loss,
+            mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
+            redirect_common_files=redirect_common_files,
+            model_dtype=model_dtype,
+            device=device,
+            model_name="FastWAMJoint",
+        )
     )
 
 
@@ -265,68 +302,26 @@ def create_fastwam_idm(
         FastWAMIDM,
     )
 
-    if isinstance(video_dit_config, DictConfig):
-        video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
-    if not isinstance(video_dit_config, dict):
-        raise ValueError(f"`video_dit_config` must resolve to a dict, got {type(video_dit_config)}")
-
-    if isinstance(action_dit_config, DictConfig):
-        action_dit_config = OmegaConf.to_container(action_dit_config, resolve=True)
-    if action_dit_config is None:
-        action_dit_config = {}
-    if not isinstance(action_dit_config, dict):
-        raise ValueError(f"`action_dit_config` must resolve to a dict, got {type(action_dit_config)}")
-
-    if isinstance(video_scheduler, DictConfig):
-        video_scheduler = OmegaConf.to_container(video_scheduler, resolve=True)
-    if video_scheduler is None:
-        video_scheduler = {}
-    if not isinstance(video_scheduler, dict):
-        raise ValueError(f"`video_scheduler` must be dict-like, got {type(video_scheduler)}")
-
-    if isinstance(action_scheduler, DictConfig):
-        action_scheduler = OmegaConf.to_container(action_scheduler, resolve=True)
-    if action_scheduler is None:
-        raise ValueError("`action_scheduler` is required for FastWAM.")
-    if not isinstance(action_scheduler, dict):
-        raise ValueError(f"`action_scheduler` must be dict-like, got {type(action_scheduler)}")
-    required_action_scheduler_keys = {"train_shift", "infer_shift", "num_train_timesteps"}
-    missing_keys = required_action_scheduler_keys - set(action_scheduler.keys())
-    if missing_keys:
-        raise ValueError(
-            f"`action_scheduler` missing required keys: {sorted(missing_keys)}. "
-            "Expected keys: train_shift, infer_shift, num_train_timesteps."
-        )
-
-    if isinstance(loss, DictConfig):
-        loss = OmegaConf.to_container(loss, resolve=True)
-    if loss is None:
-        loss = {}
-    if not isinstance(loss, dict):
-        raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
-
     return FastWAMIDM.from_wan22_pretrained(
-        device=device,
-        torch_dtype=model_dtype,
-        model_id=model_id,
-        tokenizer_model_id=tokenizer_model_id,
-        tokenizer_max_len=int(tokenizer_max_len),
-        load_text_encoder=bool(load_text_encoder),
-        proprio_dim=(None if proprio_dim is None else int(proprio_dim)),
-        redirect_common_files=bool(redirect_common_files),
-        video_dit_config=video_dit_config,
-        action_dit_config=action_dit_config,
-        action_dit_pretrained_path=action_dit_pretrained_path,
-        skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
-        mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
-        video_train_shift=float(video_scheduler.get("train_shift", 5.0)),
-        video_infer_shift=float(video_scheduler.get("infer_shift", 5.0)),
-        video_num_train_timesteps=int(video_scheduler.get("num_train_timesteps", 1000)),
-        action_train_shift=float(action_scheduler["train_shift"]),
-        action_infer_shift=float(action_scheduler["infer_shift"]),
-        action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
-        loss_lambda_video=float(loss.get("lambda_video", 1.0)),
-        loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        **_fastwam_pretrained_kwargs(
+            model_id=model_id,
+            tokenizer_model_id=tokenizer_model_id,
+            video_dit_config=video_dit_config,
+            tokenizer_max_len=tokenizer_max_len,
+            load_text_encoder=load_text_encoder,
+            proprio_dim=proprio_dim,
+            action_dit_config=action_dit_config,
+            action_dit_pretrained_path=action_dit_pretrained_path,
+            skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
+            video_scheduler=video_scheduler,
+            action_scheduler=action_scheduler,
+            loss=loss,
+            mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
+            redirect_common_files=redirect_common_files,
+            model_dtype=model_dtype,
+            device=device,
+            model_name="FastWAMIDM",
+        )
     )
 
 
