@@ -178,10 +178,18 @@ def _write_summary_files(
 def _write_failed_records(failed_tasks_file: Path, failed_records: list[dict[str, Any]]) -> None:
     with failed_tasks_file.open("w", encoding="utf-8") as f:
         for rec in failed_records:
-            f.write(
-                f"{rec['task_name']},{rec['phase']},gpu={rec['gpu_id']},"
-                f"return_code={rec['return_code']},reason={rec['reason']}\n"
-            )
+            parts = [
+                str(rec["task_name"]),
+                str(rec["phase"]),
+                f"gpu={rec['gpu_id']}",
+                f"return_code={rec['return_code']}",
+                f"reason={rec['reason']}",
+            ]
+            if rec.get("log_file"):
+                parts.append(f"log={rec['log_file']}")
+            if rec.get("result_file"):
+                parts.append(f"result={rec['result_file']}")
+            f.write(",".join(parts) + "\n")
 
 
 def _cfg_or_env(cfg: DictConfig, key: str, env_key: str, default: Any) -> Any:
@@ -189,6 +197,20 @@ def _cfg_or_env(cfg: DictConfig, key: str, env_key: str, default: Any) -> Any:
     if value is not None:
         return value
     return os.environ.get(env_key, default)
+
+
+def _latest_worker_log(run_output_dir: Path, task_name: str, phase: str) -> Path | None:
+    if phase not in {"clean", "random"} or not run_output_dir.exists():
+        return None
+    prefix = f"eval_{task_name}_{phase}_"
+    candidates = [
+        path
+        for path in run_output_dir.iterdir()
+        if path.is_file() and path.name.startswith(prefix) and path.suffix == ".log"
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
 def _sync_multinode_status(
@@ -264,7 +286,6 @@ def main(cfg: DictConfig):
     ckpt_path = _resolve_path(str(cfg.ckpt), base=PROJECT_ROOT)
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-    ckpt_tag = _resolve_ckpt_tag(ckpt_path)
 
     robotwin_root = _resolve_path(str(cfg.EVALUATION.robotwin_root), base=PROJECT_ROOT)
     if not robotwin_root.exists():
@@ -293,10 +314,7 @@ def main(cfg: DictConfig):
     gpu_ids = list(range(num_gpus))
 
     output_dir = _resolve_path(str(cfg.EVALUATION.output_dir), base=PROJECT_ROOT)
-    run_ts = output_dir.name
-    if run_ts == "":
-        raise ValueError(f"Invalid EVALUATION.output_dir (missing run_ts): {output_dir}")
-    run_output_dir = PROJECT_ROOT / "evaluate_results" / "robotwin" / ckpt_tag / run_ts
+    run_output_dir = output_dir
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
     manager_log = run_output_dir / f"manager_node_{node_rank}.log"
@@ -465,9 +483,11 @@ def main(cfg: DictConfig):
 
             if return_code != 0:
                 has_failure = True
+                worker_log = _latest_worker_log(run_output_dir, state.task_name, state.phase)
+                worker_log_text = f", log={worker_log}" if worker_log is not None else ""
                 failure_message = (
                     f"worker failed: task={state.task_name}, phase={state.phase}, "
-                    f"gpu={gpu_id}, return_code={return_code}"
+                    f"gpu={gpu_id}, return_code={return_code}{worker_log_text}"
                 )
                 failed_records.append(
                     {
@@ -476,6 +496,7 @@ def main(cfg: DictConfig):
                         "gpu_id": gpu_id,
                         "return_code": return_code,
                         "reason": "process_failed",
+                        "log_file": str(worker_log) if worker_log is not None else None,
                     }
                 )
                 log(failure_message)
@@ -488,9 +509,11 @@ def main(cfg: DictConfig):
                 success_rate = _parse_success_rate(result_file)
             except Exception as exc:
                 has_failure = True
+                worker_log = _latest_worker_log(run_output_dir, state.task_name, state.phase)
+                worker_log_text = f", log={worker_log}" if worker_log is not None else ""
                 failure_message = (
                     f"result parse failed: task={state.task_name}, phase={state.phase}, "
-                    f"gpu={gpu_id}, error={repr(exc)}"
+                    f"gpu={gpu_id}, error={repr(exc)}{worker_log_text}"
                 )
                 failed_records.append(
                     {
@@ -499,6 +522,8 @@ def main(cfg: DictConfig):
                         "gpu_id": gpu_id,
                         "return_code": return_code,
                         "reason": "result_parse_failed",
+                        "log_file": str(worker_log) if worker_log is not None else None,
+                        "result_file": str(result_file),
                     }
                 )
                 log(failure_message)

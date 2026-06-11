@@ -111,23 +111,87 @@ def _ensure_policy_symlink(robotwin_root: Path, policy_source_dir: Path) -> Path
     policy_target = policy_root / POLICY_NAME
     source_resolved = policy_source_dir.resolve()
 
-    if not policy_target.exists() and not policy_target.is_symlink():
+    def validate_existing() -> Path | None:
+        if policy_target.is_symlink():
+            target_resolved = policy_target.resolve()
+            if target_resolved == source_resolved:
+                return policy_target
+            try:
+                policy_target.unlink()
+            except FileNotFoundError:
+                pass
+            return None
+
+        if policy_target.exists():
+            raise RuntimeError(
+                f"Path already exists and is not a symlink: {policy_target}. "
+                "Please handle it manually to avoid overriding existing policy files."
+            )
+        return None
+
+    existing = validate_existing()
+    if existing is not None:
+        return existing
+
+    try:
         policy_target.symlink_to(source_resolved, target_is_directory=True)
         return policy_target
+    except FileExistsError:
+        existing = validate_existing()
+        if existing is not None:
+            return existing
+        raise
 
-    if policy_target.is_symlink():
-        target_resolved = policy_target.resolve()
-        if target_resolved != source_resolved:
-            raise RuntimeError(
-                f"Policy symlink conflict: {policy_target} -> {target_resolved}, "
-                f"expected -> {source_resolved}"
-            )
-        return policy_target
 
-    raise RuntimeError(
-        f"Path already exists and is not a symlink: {policy_target}. "
-        "Please handle it manually to avoid overriding existing policy files."
+def _result_suffix_from_task_config(task_config: str) -> str:
+    if task_config == "demo_clean":
+        return "clean"
+    if task_config == "demo_randomized":
+        return "random"
+    return task_config.replace("/", "_")
+
+
+def _timestamp_for_filename() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+
+def _resolve_run_output_dir(output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def _make_log_file(run_output_dir: Path, task_name: str, task_config: str) -> Path:
+    result_suffix = _result_suffix_from_task_config(task_config)
+    return run_output_dir / f"eval_{task_name}_{result_suffix}_{_timestamp_for_filename()}.log"
+
+
+def _make_robotwin_eval_base(run_output_dir: Path, task_name: str) -> Path:
+    return run_output_dir / task_name
+
+
+def _write_eval_config(
+    cfg: DictConfig,
+    run_output_dir: Path,
+    task_name: str,
+    task_config: str,
+) -> None:
+    result_suffix = _result_suffix_from_task_config(task_config)
+    OmegaConf.save(
+        config=cfg,
+        f=str(run_output_dir / f"eval_config_{task_name}_{result_suffix}.yaml"),
     )
+
+
+def _validate_policy_symlink(robotwin_root: Path, policy_source_dir: Path) -> None:
+    policy_target = robotwin_root / "policy" / POLICY_NAME
+    if not policy_target.is_symlink():
+        raise RuntimeError(f"Policy symlink was not created: {policy_target}")
+    target_resolved = policy_target.resolve()
+    source_resolved = policy_source_dir.resolve()
+    if target_resolved != source_resolved:
+        raise RuntimeError(
+            f"Policy symlink points to {target_resolved}, expected {source_resolved}"
+        )
 
 
 def _format_override_value(value: Any) -> str:
@@ -156,7 +220,6 @@ def main(cfg: DictConfig):
     ckpt_path = _resolve_path(str(cfg.ckpt), base=PROJECT_ROOT)
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-    ckpt_tag = _resolve_ckpt_tag(ckpt_path)
 
     robotwin_root = _resolve_path(str(cfg.EVALUATION.robotwin_root), base=PROJECT_ROOT)
     if not robotwin_root.exists():
@@ -167,30 +230,14 @@ def main(cfg: DictConfig):
         raise FileNotFoundError(f"Policy source directory not found: {policy_source_dir}")
 
     _ensure_policy_symlink(robotwin_root=robotwin_root, policy_source_dir=policy_source_dir)
+    _validate_policy_symlink(robotwin_root=robotwin_root, policy_source_dir=policy_source_dir)
 
     output_dir = _resolve_path(str(cfg.EVALUATION.output_dir), base=PROJECT_ROOT)
-    run_ts = output_dir.name
-    if run_ts == "":
-        raise ValueError(f"Invalid EVALUATION.output_dir (missing run_ts): {output_dir}")
-    run_output_dir = (
-        PROJECT_ROOT
-        / "evaluate_results"
-        / "robotwin"
-        / ckpt_tag
-        / run_ts
-    )
-    run_output_dir.mkdir(parents=True, exist_ok=True)
-    log_file = run_output_dir / (
-        f"eval_{str(cfg.EVALUATION.task_name)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    )
-    robotwin_eval_base = (
-        PROJECT_ROOT
-        / "evaluate_results"
-        / "robotwin"
-        / ckpt_tag
-        / run_ts
-        / str(cfg.EVALUATION.task_name)
-    )
+    run_output_dir = _resolve_run_output_dir(output_dir)
+    task_name = str(cfg.EVALUATION.task_name)
+    task_config = str(cfg.EVALUATION.task_config)
+    log_file = _make_log_file(run_output_dir, task_name, task_config)
+    robotwin_eval_base = _make_robotwin_eval_base(run_output_dir, task_name)
 
     sim_cfg_path = (PROJECT_ROOT / "configs" / "sim_robotwin.yaml").resolve()
     sim_task = HydraConfig.get().runtime.choices.get("task")
@@ -198,8 +245,8 @@ def main(cfg: DictConfig):
     dataset_stats_path = _resolve_dataset_stats_path(cfg, ckpt_path)
 
     overrides: list[str] = []
-    _append_override(overrides, "task_name", cfg.EVALUATION.task_name)
-    _append_override(overrides, "task_config", cfg.EVALUATION.task_config)
+    _append_override(overrides, "task_name", task_name)
+    _append_override(overrides, "task_config", task_config)
     _append_override(overrides, "ckpt_setting", str(ckpt_path))
     _append_override(overrides, "seed", cfg.seed)
     _append_override(overrides, "policy_name", cfg.EVALUATION.policy_name)
@@ -263,10 +310,7 @@ def main(cfg: DictConfig):
         raise RuntimeError(f"RoboTwin evaluation failed with return code {return_code}. Log: {log_file}")
 
     print(f"Evaluation finished successfully. Log saved to: {log_file}")
-    OmegaConf.save(
-        config=cfg,
-        f=str(run_output_dir / f"eval_config_{str(cfg.EVALUATION.task_name)}.yaml"),
-    )
+    _write_eval_config(cfg, run_output_dir, task_name, task_config)
 
 
 if __name__ == "__main__":

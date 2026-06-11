@@ -58,14 +58,14 @@ representation_forcing:
   # encoder:
   #   name: vjepa
   #   backend: hub
-  #   hub_repo: facebookresearch/vjepa2
+  #   hub_repo: facebookresearch/vjepa2:main
   #   hub_model_name: vjepa2_1_vit_large_384
   #   model_id: ""
   #   hub_source: github
   #   hub_kwargs: {}
   #   input_layout: bcthw
   #   input_size: [384, 384]
-  #   frames_per_clip: 64
+  #   frames_per_clip: 3
   #   patch_size: 16
   #   output_dim: 1024
   #   camera_layout: robotwin
