@@ -12,9 +12,9 @@ representation_forcing:
   loss_weight: 0.1
   normalize_target: false
   detach_alignment_input: false
-  # Online teacher acceleration: use one anchor frame per WAN latent-time chunk.
-  # For RobotWin's 9 video frames and 3 WAN latent frames this selects [0, 3, 7].
-  target_temporal_sampling: latent_anchor_center
+  temporal_align_mode: strict
+  spatial_align_mode: interpolate
+  target_temporal_sampling: explicit
   ## Geometric forcing
   # mode: gf
   # angular_weight: 1.0
@@ -32,6 +32,9 @@ representation_forcing:
   #   stats_path: null
   #   fit_on_the_fly: false
 
+  ## VGGT
+  target_temporal_indices: [0, 3, 7]
+  target_temporal_groups: null
   encoder:
     name: vggt
     camera_layout: robotwin
@@ -41,20 +44,28 @@ representation_forcing:
     output_dim: 2048
 
   ## DINO
+  # target_temporal_indices: [0, 3, 7]
+  # target_temporal_groups: null
   # encoder:
   #   name: dino
   #   backend: hub
   #   hub_repo: facebookresearch/dinov3
   #   hub_source: github
-  #   model_name: dinov3_vitb16
-  #   model_id: facebook/dinov3-vitb16-pretrain-lvd1689m
+  #   model_name: dinov3_vitl16
+  #   model_id: facebook/dinov3-vitl16-pretrain-lvd1689m
   #   hub_kwargs: {}
-  #   input_size: [512, 512]
-  #   output_dim: 768
+  #   input_size: [384, 384]
+  #   patch_size: 16
+  #   output_dim: 1024
   #   camera_layout: robotwin
   #   num_cameras: 3
 
   ## V-JEPA
+  # target_temporal_indices: null
+  # target_temporal_groups:
+  #   - [0, 1]
+  #   - [3, 4]
+  #   - [7, 8]
   # encoder:
   #   name: vjepa
   #   backend: hub
@@ -65,7 +76,6 @@ representation_forcing:
   #   hub_kwargs: {}
   #   input_layout: bcthw
   #   input_size: [384, 384]
-  #   frames_per_clip: 3
   #   patch_size: 16
   #   output_dim: 1024
   #   camera_layout: robotwin

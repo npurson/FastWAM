@@ -237,6 +237,90 @@ def create_vrfa(
     )
 
 
+def create_ra(
+    model_id: str,
+    tokenizer_model_id: str,
+    representation_dit_config,
+    tokenizer_max_len: int = 512,
+    load_text_encoder: bool = True,
+    proprio_dim: int | None = None,
+    action_dit_config=None,
+    action_dit_pretrained_path: str | None = None,
+    skip_dit_load_from_pretrain: bool = False,
+    representation_dit_pretrained_source: str | None = None,
+    representation_dit_pretrained_path: str | None = None,
+    representation_dit_pretrained_model_id: str | None = None,
+    # Consumed by Wan22Trainer from cfg.model; accepted here because Hydra passes
+    # all model config keys into this target.
+    representation_dit_lr_scale: float | None = None,
+    representation_scheduler=None,
+    action_scheduler=None,
+    loss=None,
+    representation=None,
+    mot_checkpoint_mixed_attn: bool = True,
+    redirect_common_files: bool = True,
+    model_dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    from .models.helpers.loader import load_wan22_text_components
+    from .models.ra import RA
+
+    representation_dit_config = _as_resolved_dict(
+        representation_dit_config,
+        "representation_dit_config",
+        required=True,
+    )
+    action_dit_config = _as_resolved_dict(action_dit_config, "action_dit_config")
+    representation_scheduler = _as_resolved_dict(representation_scheduler, "representation_scheduler")
+    action_scheduler = _as_resolved_dict(action_scheduler, "action_scheduler", required=True)
+    loss = _as_resolved_dict(loss, "loss")
+    representation = _as_resolved_dict(representation, "representation")
+    _validate_action_scheduler(action_scheduler, "RA")
+
+    text_components = load_wan22_text_components(
+        device=device,
+        torch_dtype=model_dtype,
+        model_id=model_id,
+        tokenizer_model_id=tokenizer_model_id,
+        tokenizer_max_len=int(tokenizer_max_len),
+        redirect_common_files=bool(redirect_common_files),
+        load_text_encoder=bool(load_text_encoder),
+    )
+
+    model = RA.from_config(
+        representation_dit_config=representation_dit_config,
+        action_dit_config=action_dit_config,
+        action_dit_pretrained_path=action_dit_pretrained_path,
+        skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
+        representation_dit_pretrained_source=representation_dit_pretrained_source,
+        representation_dit_pretrained_path=representation_dit_pretrained_path,
+        representation_dit_pretrained_model_id=representation_dit_pretrained_model_id or model_id,
+        mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
+        representation=representation,
+        text_encoder=text_components.text_encoder,
+        tokenizer=text_components.tokenizer,
+        text_dim=int(representation_dit_config["text_dim"]),
+        proprio_dim=None if proprio_dim is None else int(proprio_dim),
+        device=device,
+        torch_dtype=model_dtype,
+        representation_train_shift=float(representation_scheduler.get("train_shift", 5.0)),
+        representation_infer_shift=float(representation_scheduler.get("infer_shift", 5.0)),
+        representation_num_train_timesteps=int(representation_scheduler.get("num_train_timesteps", 1000)),
+        action_train_shift=float(action_scheduler["train_shift"]),
+        action_infer_shift=float(action_scheduler["infer_shift"]),
+        action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
+        loss_lambda_representation=float(loss.get("lambda_representation", 1.0)),
+        loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+    )
+    model.model_paths.update(
+        {
+            "text_encoder": text_components.text_encoder_path,
+            "tokenizer": text_components.tokenizer_path,
+        }
+    )
+    return model
+
+
 def create_fastwam_joint(
     model_id: str,
     tokenizer_model_id: str,

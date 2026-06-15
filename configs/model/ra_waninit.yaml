@@ -1,0 +1,14 @@
+defaults:
+  - ra
+  - _self_
+
+# WAN-width RA representation DiT initialized from the Wan2.2 video DiT.
+# Shape-mismatched input/output layers stay randomly initialized.
+representation_dit_pretrained_source: wan
+representation_dit_pretrained_path: null
+representation_dit_pretrained_model_id: ${model.model_id}
+representation_dit_lr_scale: 1
+
+representation_dit_config:
+  hidden_dim: 3072
+  ffn_dim: 14336

@@ -32,6 +32,33 @@ def _build_mlp(in_dim: int, hidden_dim: int, out_dim: int) -> nn.Sequential:
     )
 
 
+def _parse_temporal_indices(value: Any, name: str) -> Optional[list[int]]:
+    if value in (None, "", "null"):
+        return None
+    indices = [int(v) for v in value]
+    if not indices:
+        raise ValueError(f"`{name}` must contain at least one index.")
+    if min(indices) < 0:
+        raise ValueError(f"`{name}` must be non-negative, got {indices}.")
+    if sorted(set(indices)) != indices:
+        raise ValueError(f"`{name}` must be strictly increasing unique indices, got {indices}.")
+    return indices
+
+
+def _parse_temporal_groups(value: Any, name: str) -> Optional[list[list[int]]]:
+    if value in (None, "", "null"):
+        return None
+    groups = [[int(idx) for idx in group] for group in value]
+    if not groups:
+        raise ValueError(f"`{name}` must contain at least one group.")
+    for group in groups:
+        if not group:
+            raise ValueError(f"`{name}` cannot contain empty groups: {groups}.")
+        if min(group) < 0:
+            raise ValueError(f"`{name}` must be non-negative, got {groups}.")
+    return groups
+
+
 class RepresentationForcing(nn.Module):
     """Online VrfA targets and heads for REPA, Geometry Forcing, and ReDi."""
 
@@ -68,6 +95,18 @@ class RepresentationForcing(nn.Module):
         self.normalize_target = bool(cfg.get("normalize_target", False))
         self.detach_alignment_input = bool(cfg.get("detach_alignment_input", False))
         self.target_temporal_sampling = str(cfg.get("target_temporal_sampling", "all_interpolate")).lower()
+        self.temporal_align_mode = str(cfg.get("temporal_align_mode", "strict")).lower()
+        self.spatial_align_mode = str(cfg.get("spatial_align_mode", "strict")).lower()
+        self.target_temporal_indices = _parse_temporal_indices(
+            cfg.get("target_temporal_indices", cfg.get("temporal_indices", None)),
+            "representation_forcing.target_temporal_indices",
+        )
+        self.target_temporal_groups = _parse_temporal_groups(
+            cfg.get("target_temporal_groups", cfg.get("temporal_groups", None)),
+            "representation_forcing.target_temporal_groups",
+        )
+        if self.target_temporal_indices is not None and self.target_temporal_groups is not None:
+            raise ValueError("Use only one of `target_temporal_indices` and `target_temporal_groups`.")
         self.layer_indices = [int(v) for v in cfg.get("layer_indices", [15])]
         self.projector_hidden_dim = int(cfg.get("projector_hidden_dim", hidden_dim))
 
@@ -80,11 +119,15 @@ class RepresentationForcing(nn.Module):
             return
         if self.mode not in {"repa", "gf", "redi"}:
             raise ValueError(f"Unsupported representation forcing mode: {self.mode}")
-        if self.target_temporal_sampling not in {"all_interpolate", "latent_anchor_center"}:
+        if self.target_temporal_sampling not in {"all_interpolate", "latent_anchor_center", "explicit"}:
             raise ValueError(
                 "Unsupported representation forcing target_temporal_sampling: "
-                f"{self.target_temporal_sampling}. Expected one of: all_interpolate, latent_anchor_center."
+                f"{self.target_temporal_sampling}. Expected one of: all_interpolate, latent_anchor_center, explicit."
             )
+        if self.temporal_align_mode not in {"strict", "interpolate"}:
+            raise ValueError(f"Unsupported temporal_align_mode: {self.temporal_align_mode}")
+        if self.spatial_align_mode not in {"strict", "interpolate"}:
+            raise ValueError(f"Unsupported spatial_align_mode: {self.spatial_align_mode}")
 
         if self.mode == "repa":
             self.repa_projectors = nn.ModuleDict(
@@ -183,10 +226,39 @@ class RepresentationForcing(nn.Module):
 
         if features.ndim == 4 and features.shape[-1] == self.feature_dim:
             tokens = rearrange(features, "b t n c -> b c t n")
-            tokens = F.interpolate(tokens, size=(f, h * w), mode="bilinear", align_corners=False)
+            target_t = f
+            target_n = h * w
+            if self.temporal_align_mode == "strict" and int(tokens.shape[2]) != target_t:
+                raise ValueError(
+                    "Representation temporal grid mismatch: "
+                    f"features T={tokens.shape[2]}, target T={target_t}. "
+                    "Set `representation_forcing.temporal_align_mode=interpolate` to allow resizing."
+                )
+            if self.spatial_align_mode == "strict" and int(tokens.shape[3]) != target_n:
+                raise ValueError(
+                    "Representation spatial token mismatch: "
+                    f"features N={tokens.shape[3]}, target N={target_n}. "
+                    "Set `representation_forcing.spatial_align_mode=interpolate` to allow resizing."
+                )
+            if (int(tokens.shape[2]), int(tokens.shape[3])) != (target_t, target_n):
+                tokens = F.interpolate(tokens, size=(target_t, target_n), mode="bilinear", align_corners=False)
             tokens = rearrange(tokens, "b c t n -> b (t n) c")
         elif features.ndim == 5 and features.shape[1] == self.feature_dim:
-            features = F.interpolate(features, size=(f, h, w), mode="trilinear", align_corners=False)
+            target_size = (f, h, w)
+            if self.temporal_align_mode == "strict" and int(features.shape[2]) != f:
+                raise ValueError(
+                    "Representation temporal grid mismatch: "
+                    f"features T={features.shape[2]}, target T={f}. "
+                    "Set `representation_forcing.temporal_align_mode=interpolate` to allow resizing."
+                )
+            if self.spatial_align_mode == "strict" and tuple(int(v) for v in features.shape[-2:]) != (h, w):
+                raise ValueError(
+                    "Representation spatial grid mismatch: "
+                    f"features HW={tuple(features.shape[-2:])}, target HW={(h, w)}. "
+                    "Set `representation_forcing.spatial_align_mode=interpolate` to allow resizing."
+                )
+            if tuple(int(v) for v in features.shape[2:]) != target_size:
+                features = F.interpolate(features, size=target_size, mode="trilinear", align_corners=False)
             tokens = rearrange(features, "b c t h w -> b (t h w) c")
         else:
             raise ValueError(
@@ -230,9 +302,10 @@ class RepresentationForcing(nn.Module):
         input_video: torch.Tensor,
         grid_size: tuple[int, int, int],
     ) -> torch.Tensor:
-        if self.target_temporal_sampling == "all_interpolate":
+        has_explicit_temporal = self.target_temporal_indices is not None or self.target_temporal_groups is not None
+        if self.target_temporal_sampling == "all_interpolate" and not has_explicit_temporal:
             return input_video
-        if self.target_temporal_sampling != "latent_anchor_center":
+        if self.target_temporal_sampling not in {"latent_anchor_center", "explicit"}:
             raise ValueError(f"Unsupported target_temporal_sampling: {self.target_temporal_sampling}")
         if input_video.ndim != 5:
             raise ValueError(f"`input_video` must be [B,C,T,H,W], got {tuple(input_video.shape)}")
@@ -243,6 +316,29 @@ class RepresentationForcing(nn.Module):
             raise ValueError(f"Invalid target temporal grid size: {target_frames}")
         if source_frames <= 0:
             raise ValueError(f"Invalid input video temporal size: {source_frames}")
+        if self.target_temporal_groups is not None:
+            max_index = max(max(group) for group in self.target_temporal_groups)
+            if max_index >= source_frames:
+                raise ValueError(
+                    "representation_forcing.target_temporal_groups exceeds input video length: "
+                    f"groups={self.target_temporal_groups}, video_frames={source_frames}."
+                )
+            flat_indices = [idx for group in self.target_temporal_groups for idx in group]
+            index_tensor = torch.as_tensor(flat_indices, device=input_video.device, dtype=torch.long)
+            return input_video.index_select(dim=2, index=index_tensor)
+        if self.target_temporal_indices is not None:
+            max_index = max(self.target_temporal_indices)
+            if max_index >= source_frames:
+                raise ValueError(
+                    "representation_forcing.target_temporal_indices exceeds input video length: "
+                    f"indices={self.target_temporal_indices}, video_frames={source_frames}."
+                )
+            index_tensor = torch.as_tensor(self.target_temporal_indices, device=input_video.device, dtype=torch.long)
+            return input_video.index_select(dim=2, index=index_tensor)
+        if self.target_temporal_sampling == "explicit":
+            raise ValueError(
+                "`target_temporal_sampling=explicit` requires `target_temporal_indices` or `target_temporal_groups`."
+            )
         if target_frames >= source_frames:
             return input_video
         if target_frames == 1:

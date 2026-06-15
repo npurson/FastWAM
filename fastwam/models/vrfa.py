@@ -28,6 +28,12 @@ class VrfA(FastWAM):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self.capability = {
+            "video_inference": True,
+            "vae_reconstruction": True,
+            "action_inference": True,
+        }
+        self.capabilities = self.capability
         self._capture_representation_viz = False
         self._last_representation_viz = None
         self._init_representation_forcing(representation_forcing)

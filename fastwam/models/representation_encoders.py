@@ -510,7 +510,6 @@ class VJEPARepresentationEncoder(BaseRepresentationEncoder):
         input_layout: str = "bcthw",
         input_size: tuple[int, int] = (384, 384),
         output_dim: int = 1024,
-        frames_per_clip: Optional[int] = 64,
         patch_size: Optional[int] = 16,
         camera_layout: str = "none",
         num_cameras: int = 1,
@@ -528,7 +527,6 @@ class VJEPARepresentationEncoder(BaseRepresentationEncoder):
         self.hub_source = hub_source
         self.hub_kwargs = _as_plain_dict(hub_kwargs)
         self.input_layout = str(input_layout).lower()
-        self.frames_per_clip = None if frames_per_clip is None else int(frames_per_clip)
         self.patch_size = None if patch_size is None else int(patch_size)
 
     def _load(self, device: torch.device):
@@ -577,9 +575,7 @@ class VJEPARepresentationEncoder(BaseRepresentationEncoder):
         x = (video.detach().float() + 1.0) * 0.5
         x = x.clamp(0.0, 1.0)
         batch_size, _, num_frames, _, _ = x.shape
-        frames_per_clip = self.frames_per_clip
-        if frames_per_clip is None:
-            frames_per_clip = int(getattr(self.model.config, "frames_per_clip", num_frames))
+        frames_per_clip = int(num_frames)
         x = F.interpolate(
             x,
             size=(frames_per_clip, self.input_size[0], self.input_size[1]),

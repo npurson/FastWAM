@@ -30,6 +30,14 @@ class Wan22LoadedComponents:
     tokenizer_path: str | None
 
 
+@dataclass
+class Wan22LoadedTextComponents:
+    text_encoder: WanTextEncoder | None
+    tokenizer: HuggingfaceTokenizer | None
+    text_encoder_path: str | None
+    tokenizer_path: str | None
+
+
 WAN22_MODEL_REGISTRY = [
     {
         # Example: ModelConfig(model_id="Wan-AI/Wan2.1-T2V-14B", origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth")
@@ -218,4 +226,51 @@ def load_wan22_ti2v_5b_components(
         vae_path=str(vae_config.path),
         text_encoder_path=text_encoder_path,
         tokenizer_path=tokenizer_path,
+    )
+
+
+def load_wan22_text_components(
+    device: str = "cuda",
+    torch_dtype: torch.dtype = torch.bfloat16,
+    model_id: str = "Wan-AI/Wan2.2-TI2V-5B",
+    tokenizer_model_id: str = "Wan-AI/Wan2.1-T2V-1.3B",
+    tokenizer_max_len: int = 512,
+    redirect_common_files: bool = True,
+    load_text_encoder: bool = True,
+) -> Wan22LoadedTextComponents:
+    if not load_text_encoder:
+        logger.info(
+            "Skipping pretrained text encoder/tokenizer load (`load_text_encoder=False`); "
+            "training must provide cached `context/context_mask`."
+        )
+        return Wan22LoadedTextComponents(
+            text_encoder=None,
+            tokenizer=None,
+            text_encoder_path=None,
+            tokenizer_path=None,
+        )
+
+    _, text_config, _, tokenizer_config = _resolve_configs(
+        model_id=model_id,
+        tokenizer_model_id=tokenizer_model_id,
+        redirect_common_files=redirect_common_files,
+    )
+    text_config.download_if_necessary()
+    tokenizer_config.download_if_necessary()
+    text_encoder = _load_registered_model(
+        text_config.path,
+        "wan_video_text_encoder",
+        torch_dtype=torch_dtype,
+        device=device,
+    )
+    tokenizer = HuggingfaceTokenizer(
+        name=tokenizer_config.path,
+        seq_len=int(tokenizer_max_len),
+        clean="whitespace",
+    )
+    return Wan22LoadedTextComponents(
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        text_encoder_path=str(text_config.path),
+        tokenizer_path=str(tokenizer_config.path),
     )

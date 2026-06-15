@@ -1,0 +1,116 @@
+_target_: fastwam.runtime.create_ra
+model_id: Wan-AI/Wan2.2-TI2V-5B
+tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
+tokenizer_max_len: 128
+load_text_encoder: false
+proprio_dim: ${data.train.processor.proprio_output_dim}
+redirect_common_files: true
+mot_checkpoint_mixed_attn: true
+action_dit_pretrained_path: /horizon-bucket/robot_lab/users/haoyi.jiang/repos/fastwam/checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+skip_dit_load_from_pretrain: false
+
+representation:
+  target_dim: ${model.representation.encoder.output_dim}
+  # Indices over RobotWin's already sampled 9-frame video sequence.
+  # [0,4,8] means online teacher only encodes original steps [0,16,32].
+  temporal_align_mode: strict
+  latent_spatial_size: [12, 10]
+  normalize_target: false
+
+  ## VGGT
+  temporal_indices: [0, 2, 4, 6, 8]
+  temporal_groups: null
+  encoder:
+    name: vggt
+    camera_layout: robotwin
+    num_cameras: 3
+    model_id: facebook/VGGT-1B
+    input_size: [224, 280]
+    patch_size: 14
+    layer_index: -1
+    output_dim: 2048
+
+  ## DINOv3
+  # temporal_indices: [0, 2, 4, 6, 8]
+  # temporal_groups: null
+  # encoder:
+  #   name: dino
+  #   backend: hub
+  #   hub_repo: facebookresearch/dinov3:main
+  #   hub_source: github
+  #   model_name: dinov3_vitl16
+  #   model_id: facebook/dinov3-vitl16-pretrain-lvd1689m
+  #   hub_kwargs: {}
+  #   input_size: [384, 384]
+  #   patch_size: 16
+  #   output_dim: 1024
+  #   camera_layout: robotwin
+  #   num_cameras: 3
+
+  ## V-JEPA
+  # temporal_indices: null
+  # temporal_groups:
+  #   - [0, 0]
+  #   - [1, 2]
+  #   - [4, 5]
+  #   - [7, 8]
+  # encoder:
+  #   name: vjepa
+  #   backend: hub
+  #   hub_repo: facebookresearch/vjepa2:main
+  #   hub_model_name: vjepa2_1_vit_large_384
+  #   model_id: ""
+  #   hub_source: github
+  #   hub_kwargs: {}
+  #   input_layout: bcthw
+  #   input_size: [384, 384]
+  #   patch_size: 16
+  #   output_dim: 1024
+  #   camera_layout: robotwin
+  #   num_cameras: 3
+
+representation_dit_config:
+  has_image_input: false
+  patch_size: [1, 2, 2]
+  in_dim: ${model.representation.target_dim}
+  hidden_dim: 2048
+  ffn_dim: 8192
+  freq_dim: 256
+  text_dim: 4096
+  out_dim: ${model.representation.target_dim}
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  eps: 1.0e-06
+  seperated_timestep: true
+  require_clip_embedding: false
+  require_vae_embedding: false
+  fuse_vae_embedding_in_latents: true
+  video_attention_mask_mode: "first_frame_causal"
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+
+action_dit_config:
+  action_dim: ${data.train.processor.action_output_dim}
+  hidden_dim: 1024
+  ffn_dim: 4096
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  text_dim: 4096
+  freq_dim: 256
+  eps: 1.0e-06
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+
+representation_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+action_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+loss:
+  lambda_representation: 1.0
+  lambda_action: 1.0
