@@ -1,6 +1,7 @@
 import csv
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -192,6 +193,58 @@ def _write_failed_records(failed_tasks_file: Path, failed_records: list[dict[str
             f.write(",".join(parts) + "\n")
 
 
+def _safe_filename(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("_") or "unknown"
+
+
+def _timestamp_for_filename() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+
+def _make_worker_log_file(run_output_dir: Path, task_name: str, phase: str, gpu_id: int) -> Path:
+    task_part = _safe_filename(task_name)
+    phase_part = _safe_filename(phase)
+    return run_output_dir / (
+        f"worker_{task_part}_{phase_part}_gpu{gpu_id}_{_timestamp_for_filename()}.log"
+    )
+
+
+def _write_abort_signal(
+    *,
+    abort_file: Path,
+    node_rank: int,
+    failure_message: str,
+) -> None:
+    if abort_file.exists():
+        return
+    payload = {
+        "node_rank": node_rank,
+        "failure_message": failure_message,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    tmp_path = abort_file.with_name(f".{abort_file.name}.{node_rank}.{os.getpid()}.tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    try:
+        os.replace(tmp_path, abort_file)
+    except FileExistsError:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _read_abort_signal(abort_file: Path) -> dict[str, Any] | None:
+    if not abort_file.exists():
+        return None
+    try:
+        return json.loads(abort_file.read_text(encoding="utf-8"))
+    except Exception:
+        return {
+            "node_rank": "unknown",
+            "failure_message": f"failed to parse abort signal: {abort_file}",
+        }
+
+
 def _cfg_or_env(cfg: DictConfig, key: str, env_key: str, default: Any) -> Any:
     value = cfg.MULTIRUN.get(key)
     if value is not None:
@@ -274,6 +327,7 @@ class RunningState:
     gpu_id: int
     phase: str  # "clean" | "random"
     process: subprocess.Popen[str]
+    log_file: Path
 
 
 @hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_robotwin.yaml")
@@ -324,6 +378,7 @@ def main(cfg: DictConfig):
     final_failed_tasks_file = run_output_dir / "failed_tasks.txt"
     final_summary_csv = run_output_dir / "summary.csv"
     final_summary_json = run_output_dir / "summary.json"
+    abort_file = run_output_dir / "multinode_abort.json"
 
     task_name_cfg = cfg.EVALUATION.task_name
     if task_name_cfg is None or str(task_name_cfg).strip() == "":
@@ -357,6 +412,7 @@ def main(cfg: DictConfig):
         task_config = phase_to_task_config[phase]
         cmd = [
             sys.executable,
+            "-u",
             str(SINGLE_ENTRY),
             f"ckpt={str(ckpt_path)}",
             f"gpu_id={gpu_id}",
@@ -369,20 +425,33 @@ def main(cfg: DictConfig):
 
     def launch_phase(task_name: str, gpu_id: int, phase: str) -> RunningState:
         cmd = build_cmd(task_name=task_name, gpu_id=gpu_id, phase=phase)
+        worker_log_file = _make_worker_log_file(
+            run_output_dir=run_output_dir,
+            task_name=task_name,
+            phase=phase,
+            gpu_id=gpu_id,
+        )
         log(
             f"launch task={task_name} phase={phase} gpu={gpu_id} "
-            f"cmd={' '.join(cmd)}"
+            f"log={worker_log_file} cmd={' '.join(cmd)}"
         )
-        process = subprocess.Popen(
-            cmd,
-            cwd=str(PROJECT_ROOT),
-            text=True,
-        )
+        with worker_log_file.open("w", encoding="utf-8") as worker_log_f:
+            worker_log_f.write(f"[manager] cwd={PROJECT_ROOT}\n")
+            worker_log_f.write(f"[manager] cmd={' '.join(cmd)}\n")
+            worker_log_f.flush()
+            process = subprocess.Popen(
+                cmd,
+                cwd=str(PROJECT_ROOT),
+                stdout=worker_log_f,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
         return RunningState(
             task_name=task_name,
             gpu_id=gpu_id,
             phase=phase,
             process=process,
+            log_file=worker_log_file,
         )
 
     def terminate_all_running() -> None:
@@ -402,6 +471,25 @@ def main(cfg: DictConfig):
                 log(f"killing task={state.task_name} phase={state.phase} gpu={state.gpu_id}")
                 state.process.kill()
                 state.process.wait()
+
+    def apply_remote_abort_if_any() -> bool:
+        nonlocal has_failure, failure_message
+        if num_nodes <= 1 or has_failure:
+            return False
+        abort_payload = _read_abort_signal(abort_file)
+        if abort_payload is None:
+            return False
+        origin_rank = abort_payload.get("node_rank", "unknown")
+        origin_failure = abort_payload.get("failure_message", "")
+        failure_message = (
+            f"aborted due to remote node failure: node_rank={origin_rank}, "
+            f"reason={origin_failure}"
+        )
+        has_failure = True
+        log(failure_message)
+        terminate_all_running()
+        running_states.clear()
+        return True
 
     def gpu_running_count(gpu_id: int) -> int:
         count = 0
@@ -484,7 +572,8 @@ def main(cfg: DictConfig):
             if return_code != 0:
                 has_failure = True
                 worker_log = _latest_worker_log(run_output_dir, state.task_name, state.phase)
-                worker_log_text = f", log={worker_log}" if worker_log is not None else ""
+                log_path = worker_log or state.log_file
+                worker_log_text = f", log={log_path}"
                 failure_message = (
                     f"worker failed: task={state.task_name}, phase={state.phase}, "
                     f"gpu={gpu_id}, return_code={return_code}{worker_log_text}"
@@ -496,10 +585,16 @@ def main(cfg: DictConfig):
                         "gpu_id": gpu_id,
                         "return_code": return_code,
                         "reason": "process_failed",
-                        "log_file": str(worker_log) if worker_log is not None else None,
+                        "log_file": str(log_path),
                     }
                 )
                 log(failure_message)
+                if num_nodes > 1:
+                    _write_abort_signal(
+                        abort_file=abort_file,
+                        node_rank=node_rank,
+                        failure_message=failure_message,
+                    )
                 terminate_all_running()
                 running_states.clear()
                 break
@@ -510,7 +605,8 @@ def main(cfg: DictConfig):
             except Exception as exc:
                 has_failure = True
                 worker_log = _latest_worker_log(run_output_dir, state.task_name, state.phase)
-                worker_log_text = f", log={worker_log}" if worker_log is not None else ""
+                log_path = worker_log or state.log_file
+                worker_log_text = f", log={log_path}"
                 failure_message = (
                     f"result parse failed: task={state.task_name}, phase={state.phase}, "
                     f"gpu={gpu_id}, error={repr(exc)}{worker_log_text}"
@@ -522,11 +618,17 @@ def main(cfg: DictConfig):
                         "gpu_id": gpu_id,
                         "return_code": return_code,
                         "reason": "result_parse_failed",
-                        "log_file": str(worker_log) if worker_log is not None else None,
+                        "log_file": str(log_path),
                         "result_file": str(result_file),
                     }
                 )
                 log(failure_message)
+                if num_nodes > 1:
+                    _write_abort_signal(
+                        abort_file=abort_file,
+                        node_rank=node_rank,
+                        failure_message=failure_message,
+                    )
                 terminate_all_running()
                 running_states.clear()
                 break
@@ -548,6 +650,8 @@ def main(cfg: DictConfig):
             try_launch_pending(gpu_id)
 
         if has_failure:
+            break
+        if apply_remote_abort_if_any():
             break
         if not progressed:
             time.sleep(POLL_INTERVAL_SEC)
@@ -580,15 +684,32 @@ def main(cfg: DictConfig):
             f"waiting for multinode eval barrier addr={master_addr} "
             f"port={master_port} timeout_s={barrier_timeout_s}"
         )
-        statuses = _sync_multinode_status(
-            master_addr=master_addr,
-            master_port=master_port,
-            num_nodes=num_nodes,
-            node_rank=node_rank,
-            timeout_s=barrier_timeout_s,
-            has_failure=has_failure,
-            failure_message=failure_message,
-        )
+        try:
+            statuses = _sync_multinode_status(
+                master_addr=master_addr,
+                master_port=master_port,
+                num_nodes=num_nodes,
+                node_rank=node_rank,
+                timeout_s=barrier_timeout_s,
+                has_failure=has_failure,
+                failure_message=failure_message,
+            )
+        except Exception as exc:
+            abort_payload = _read_abort_signal(abort_file)
+            abort_text = ""
+            if abort_payload is not None:
+                abort_text = (
+                    f"; abort_signal=node_rank={abort_payload.get('node_rank')}, "
+                    f"reason={abort_payload.get('failure_message')}"
+                )
+            local_status = (
+                f"local node {node_rank} status: has_failure={has_failure}, "
+                f"failure_message={failure_message or '<none>'}"
+            )
+            raise RuntimeError(
+                "multinode eval barrier failed before all nodes reported status; "
+                f"{local_status}{abort_text}. Original error: {repr(exc)}"
+            ) from exc
         log("multinode eval barrier passed")
 
     failed_statuses = [status for status in statuses if status.get("has_failure")]

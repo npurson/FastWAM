@@ -29,9 +29,11 @@ Examples:
      gpu_id=0
 """
 
+import fcntl
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -143,6 +145,20 @@ def _ensure_policy_symlink(robotwin_root: Path, policy_source_dir: Path) -> Path
         raise
 
 
+@contextmanager
+def _policy_symlink_lock(robotwin_root: Path):
+    policy_root = robotwin_root / "policy"
+    if not policy_root.is_dir():
+        raise FileNotFoundError(f"RoboTwin policy directory not found: {policy_root}")
+    lock_path = policy_root / f".{POLICY_NAME}.lock"
+    with lock_path.open("w", encoding="utf-8") as lock_f:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+
+
 def _result_suffix_from_task_config(task_config: str) -> str:
     if task_config == "demo_clean":
         return "clean"
@@ -229,8 +245,9 @@ def main(cfg: DictConfig):
     if not policy_source_dir.is_dir():
         raise FileNotFoundError(f"Policy source directory not found: {policy_source_dir}")
 
-    _ensure_policy_symlink(robotwin_root=robotwin_root, policy_source_dir=policy_source_dir)
-    _validate_policy_symlink(robotwin_root=robotwin_root, policy_source_dir=policy_source_dir)
+    with _policy_symlink_lock(robotwin_root):
+        _ensure_policy_symlink(robotwin_root=robotwin_root, policy_source_dir=policy_source_dir)
+        _validate_policy_symlink(robotwin_root=robotwin_root, policy_source_dir=policy_source_dir)
 
     output_dir = _resolve_path(str(cfg.EVALUATION.output_dir), base=PROJECT_ROOT)
     run_output_dir = _resolve_run_output_dir(output_dir)
