@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import inspect
 from pathlib import Path
@@ -93,6 +94,68 @@ def _validate_action_scheduler(action_scheduler: dict, model_name: str):
             f"`action_scheduler` missing required keys for {model_name}: {sorted(missing_keys)}. "
             "Expected keys: train_shift, infer_shift, num_train_timesteps."
         )
+
+
+def _is_auto(value) -> bool:
+    return isinstance(value, str) and value.strip().lower() == "auto"
+
+
+def _resolve_rarae_shift(
+    *,
+    value,
+    representation: dict,
+    representation_dit_config: dict,
+    shift_base_dim: int,
+    shift_scope: str,
+    name: str,
+) -> float:
+    if not _is_auto(value):
+        return float(value)
+    encoder_cfg = _as_resolved_dict(representation.get("encoder", {}), "representation.encoder")
+    channels = int(
+        representation.get(
+            "target_dim",
+            encoder_cfg.get("output_dim", representation_dit_config.get("in_dim", 1024)),
+        )
+    )
+    latent_spatial_size = representation.get("latent_spatial_size", [12, 10])
+    if isinstance(latent_spatial_size, int):
+        height = width = int(latent_spatial_size)
+    else:
+        height, width = int(latent_spatial_size[0]), int(latent_spatial_size[1])
+    temporal_groups = representation.get("temporal_groups", None)
+    temporal_indices = representation.get("temporal_indices", None)
+    if temporal_groups not in (None, "", "null"):
+        steps = len(temporal_groups)
+    elif temporal_indices not in (None, "", "null"):
+        steps = len(temporal_indices)
+    else:
+        steps = 3
+    scope = str(shift_scope).lower()
+    if scope == "future_tokens":
+        time_steps = max(int(steps) - 1, 1)
+    elif scope == "all_tokens":
+        time_steps = max(int(steps), 1)
+    else:
+        raise ValueError(f"Unsupported RARAE representation_scheduler.shift_scope: {shift_scope!r}.")
+    if shift_base_dim <= 0:
+        raise ValueError(f"RARAE representation_scheduler.shift_base_dim must be positive, got {shift_base_dim}.")
+    latent_dim = channels * time_steps * height * width
+    shift = math.sqrt(float(latent_dim) / float(shift_base_dim))
+    logger.info(
+        "Resolved RARAE %s=auto to %.4f from latent_dim=%d "
+        "(C=%d T=%d H=%d W=%d base=%d scope=%s).",
+        name,
+        shift,
+        latent_dim,
+        channels,
+        time_steps,
+        height,
+        width,
+        shift_base_dim,
+        scope,
+    )
+    return float(shift)
 
 
 def _fastwam_pretrained_kwargs(
@@ -305,6 +368,115 @@ def create_ra(
         torch_dtype=model_dtype,
         representation_train_shift=float(representation_scheduler.get("train_shift", 5.0)),
         representation_infer_shift=float(representation_scheduler.get("infer_shift", 5.0)),
+        representation_num_train_timesteps=int(representation_scheduler.get("num_train_timesteps", 1000)),
+        action_train_shift=float(action_scheduler["train_shift"]),
+        action_infer_shift=float(action_scheduler["infer_shift"]),
+        action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
+        loss_lambda_representation=float(loss.get("lambda_representation", 1.0)),
+        loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+    )
+    model.model_paths.update(
+        {
+            "text_encoder": text_components.text_encoder_path,
+            "tokenizer": text_components.tokenizer_path,
+        }
+    )
+    return model
+
+
+def create_rarae(
+    model_id: str,
+    tokenizer_model_id: str,
+    representation_dit_config,
+    tokenizer_max_len: int = 512,
+    load_text_encoder: bool = True,
+    proprio_dim: int | None = None,
+    action_dit_config=None,
+    action_dit_pretrained_path: str | None = None,
+    skip_dit_load_from_pretrain: bool = False,
+    representation_dit_pretrained_source: str | None = None,
+    representation_dit_pretrained_path: str | None = None,
+    representation_dit_pretrained_model_id: str | None = None,
+    representation_dit_lr_scale: float | None = None,
+    representation_scheduler=None,
+    action_scheduler=None,
+    loss=None,
+    representation=None,
+    representation_prediction=None,
+    mot_checkpoint_mixed_attn: bool = True,
+    redirect_common_files: bool = True,
+    model_dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    del representation_dit_lr_scale
+    from .models.helpers.loader import load_wan22_text_components
+    from .models.ra import RARAE
+
+    representation_dit_config = _as_resolved_dict(
+        representation_dit_config,
+        "representation_dit_config",
+        required=True,
+    )
+    action_dit_config = _as_resolved_dict(action_dit_config, "action_dit_config")
+    representation_scheduler = _as_resolved_dict(representation_scheduler, "representation_scheduler")
+    action_scheduler = _as_resolved_dict(action_scheduler, "action_scheduler", required=True)
+    loss = _as_resolved_dict(loss, "loss")
+    representation = _as_resolved_dict(representation, "representation")
+    representation_prediction = _as_resolved_dict(
+        representation_prediction,
+        "representation_prediction",
+        default={"type": "x", "x_loss_mode": "direct", "t_eps": 0.05},
+    )
+    _validate_action_scheduler(action_scheduler, "RARAE")
+
+    shift_base_dim = int(representation_scheduler.get("shift_base_dim", 4096))
+    shift_scope = str(representation_scheduler.get("shift_scope", "future_tokens"))
+    representation_train_shift = _resolve_rarae_shift(
+        value=representation_scheduler.get("train_shift", "auto"),
+        representation=representation,
+        representation_dit_config=representation_dit_config,
+        shift_base_dim=shift_base_dim,
+        shift_scope=shift_scope,
+        name="train_shift",
+    )
+    representation_infer_shift = _resolve_rarae_shift(
+        value=representation_scheduler.get("infer_shift", "auto"),
+        representation=representation,
+        representation_dit_config=representation_dit_config,
+        shift_base_dim=shift_base_dim,
+        shift_scope=shift_scope,
+        name="infer_shift",
+    )
+
+    text_components = load_wan22_text_components(
+        device=device,
+        torch_dtype=model_dtype,
+        model_id=model_id,
+        tokenizer_model_id=tokenizer_model_id,
+        tokenizer_max_len=int(tokenizer_max_len),
+        redirect_common_files=bool(redirect_common_files),
+        load_text_encoder=bool(load_text_encoder),
+    )
+
+    model = RARAE.from_config(
+        representation_dit_config=representation_dit_config,
+        action_dit_config=action_dit_config,
+        action_dit_pretrained_path=action_dit_pretrained_path,
+        skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
+        representation_dit_pretrained_source=representation_dit_pretrained_source,
+        representation_dit_pretrained_path=representation_dit_pretrained_path,
+        representation_dit_pretrained_model_id=representation_dit_pretrained_model_id or model_id,
+        mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
+        representation=representation,
+        representation_prediction=representation_prediction,
+        text_encoder=text_components.text_encoder,
+        tokenizer=text_components.tokenizer,
+        text_dim=int(representation_dit_config["text_dim"]),
+        proprio_dim=None if proprio_dim is None else int(proprio_dim),
+        device=device,
+        torch_dtype=model_dtype,
+        representation_train_shift=representation_train_shift,
+        representation_infer_shift=representation_infer_shift,
         representation_num_train_timesteps=int(representation_scheduler.get("num_train_timesteps", 1000)),
         action_train_shift=float(action_scheduler["train_shift"]),
         action_infer_shift=float(action_scheduler["infer_shift"]),

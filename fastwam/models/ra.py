@@ -40,6 +40,12 @@ def _as_hw(value: Any, default: tuple[int, int]) -> tuple[int, int]:
     return int(value[0]), int(value[1])
 
 
+def _as_optional_path(value: Any) -> Optional[str]:
+    if value in (None, "", "null"):
+        return None
+    return str(value)
+
+
 def _parse_temporal_indices(value: Any, name: str, min_steps: int) -> Optional[list[int]]:
     if value in (None, "", "null"):
         return None
@@ -158,6 +164,7 @@ class RA(nn.Module):
         loss_lambda_representation: float = 1.0,
         loss_lambda_action: float = 1.0,
         representation: Optional[dict[str, Any]] = None,
+        representation_prediction: Optional[dict[str, Any]] = None,
     ):
         super().__init__()
         self.representation_expert = representation_expert
@@ -209,6 +216,25 @@ class RA(nn.Module):
         self.infer_scheduler = self.infer_representation_scheduler
 
         representation = _as_plain_dict(representation)
+        representation_prediction = _as_plain_dict(representation_prediction)
+        self.representation_prediction_type = str(
+            representation_prediction.get("type", representation_prediction.get("prediction", "velocity"))
+        ).lower()
+        if self.representation_prediction_type not in {"velocity", "x"}:
+            raise ValueError(
+                "representation_prediction.type must be one of {'velocity', 'x'}, "
+                f"got {self.representation_prediction_type!r}."
+            )
+        self.representation_x_loss_mode = str(representation_prediction.get("x_loss_mode", "direct")).lower()
+        if self.representation_x_loss_mode not in {"direct", "velocity_equivalent"}:
+            raise ValueError(
+                "representation_prediction.x_loss_mode must be one of {'direct', 'velocity_equivalent'}, "
+                f"got {self.representation_x_loss_mode!r}."
+            )
+        self.representation_t_eps = float(representation_prediction.get("t_eps", 0.05))
+        if self.representation_t_eps <= 0:
+            raise ValueError(f"representation_prediction.t_eps must be positive, got {self.representation_t_eps}.")
+
         self.target_dim = int(
             representation.get(
                 "target_dim",
@@ -221,7 +247,45 @@ class RA(nn.Module):
                 f"expert={getattr(self.representation_expert, 'in_dim', None)} target={self.target_dim}."
             )
         self.latent_spatial_size = _as_hw(representation.get("latent_spatial_size", None), default=(12, 10))
-        self.normalize_target = bool(representation.get("normalize_target", False))
+        normalize_target = representation.get("normalize_target", False)
+        if isinstance(normalize_target, str):
+            self.normalize_target_mode = normalize_target.lower()
+        else:
+            self.normalize_target_mode = "per_sample" if bool(normalize_target) else "none"
+        if self.normalize_target_mode in {"false", "off", "no", "0"}:
+            self.normalize_target_mode = "none"
+        if self.normalize_target_mode in {"true", "on", "yes", "1"}:
+            self.normalize_target_mode = "per_sample"
+        if self.normalize_target_mode not in {"none", "per_sample", "dataset"}:
+            raise ValueError(
+                "RA representation.normalize_target must be false/true or one of "
+                "{'none', 'per_sample', 'dataset'}, "
+                f"got {normalize_target!r}."
+            )
+        self.normalize_target = self.normalize_target_mode != "none"
+        self.latent_stats_path = _as_optional_path(
+            representation.get("latent_stats_path", representation.get("normalization_stat_path", None))
+        )
+        self.register_buffer("latent_mean", None, persistent=False)
+        self.register_buffer("latent_var", None, persistent=False)
+        self.latent_stats_eps = float(representation.get("latent_stats_eps", 1e-5))
+        if self.normalize_target_mode == "dataset":
+            if self.latent_stats_path is None:
+                logger.warning(
+                    "RA representation.normalize_target='dataset' was set without latent_stats_path; "
+                    "falling back to no target normalization."
+                )
+                self.normalize_target_mode = "none"
+                self.normalize_target = False
+            else:
+                stats = torch.load(self.latent_stats_path, map_location="cpu")
+                mean = stats.get("mean", None)
+                var = stats.get("var", stats.get("variance", None))
+                if mean is None or var is None:
+                    raise ValueError(f"Latent stats file must contain `mean` and `var`: {self.latent_stats_path}")
+                self.latent_mean = mean.detach().float()
+                self.latent_var = var.detach().float()
+                logger.info("Loaded RA latent normalization stats from %s.", self.latent_stats_path)
         self.temporal_align_mode = str(representation.get("temporal_align_mode", "strict")).lower()
         if self.temporal_align_mode not in {"strict", "interpolate"}:
             raise ValueError(f"Unsupported RA representation.temporal_align_mode: {self.temporal_align_mode}")
@@ -277,6 +341,7 @@ class RA(nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_representation: float = 1.0,
         loss_lambda_action: float = 1.0,
+        representation_prediction: Optional[dict[str, Any]] = None,
     ) -> "RA":
         representation = _as_plain_dict(representation)
         representation_encoder = build_representation_encoder(representation)
@@ -345,6 +410,7 @@ class RA(nn.Module):
             loss_lambda_representation=loss_lambda_representation,
             loss_lambda_action=loss_lambda_action,
             representation=representation,
+            representation_prediction=representation_prediction,
         )
         model.model_paths = {
             "representation_dit": (
@@ -367,6 +433,48 @@ class RA(nn.Module):
         if self.text_encoder is not None:
             self.text_encoder.to(*args, **kwargs)
         return self
+
+    def _normalize_representation_features(self, features: torch.Tensor) -> torch.Tensor:
+        if self.normalize_target_mode == "none":
+            return features
+        if self.normalize_target_mode == "per_sample":
+            mean = features.mean(dim=(1, 2, 3, 4), keepdim=True)
+            std = features.std(dim=(1, 2, 3, 4), keepdim=True)
+            return (features - mean) / (std + 1e-6)
+        if self.latent_mean is None or self.latent_var is None:
+            raise ValueError("Dataset latent normalization requested but latent stats were not loaded.")
+        mean = self.latent_mean.to(device=features.device, dtype=features.dtype)
+        var = self.latent_var.to(device=features.device, dtype=features.dtype)
+        if mean.ndim == 3:
+            mean = mean.unsqueeze(0).unsqueeze(2)
+        elif mean.ndim == 4:
+            mean = mean.unsqueeze(2)
+        elif mean.ndim == 5:
+            pass
+        else:
+            raise ValueError(f"Unsupported latent mean shape: {tuple(mean.shape)}")
+        if var.ndim == 3:
+            var = var.unsqueeze(0).unsqueeze(2)
+        elif var.ndim == 4:
+            var = var.unsqueeze(2)
+        elif var.ndim == 5:
+            pass
+        else:
+            raise ValueError(f"Unsupported latent var shape: {tuple(var.shape)}")
+        if mean.shape[-2:] != features.shape[-2:]:
+            mean = F.interpolate(
+                mean.flatten(0, 2).unsqueeze(0),
+                size=features.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0).reshape(*mean.shape[:-2], features.shape[-2], features.shape[-1])
+            var = F.interpolate(
+                var.flatten(0, 2).unsqueeze(0),
+                size=features.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0).reshape(*var.shape[:-2], features.shape[-2], features.shape[-1])
+        return (features - mean) / torch.sqrt(var.clamp_min(0.0) + self.latent_stats_eps)
 
     def _freeze_representation_encoder(self):
         self.representation_encoder.eval()
@@ -508,10 +616,7 @@ class RA(nn.Module):
                 mode="trilinear",
                 align_corners=False,
             )
-        if self.normalize_target:
-            mean = features.mean(dim=(1, 2, 3, 4), keepdim=True)
-            std = features.std(dim=(1, 2, 3, 4), keepdim=True)
-            features = (features - mean) / (std + 1e-6)
+        features = self._normalize_representation_features(features)
         return features.to(device=self.device, dtype=self.torch_dtype)
 
     def _align_representation_temporal_size(self, features: torch.Tensor, target_frames: int) -> torch.Tensor:
@@ -724,6 +829,98 @@ class RA(nn.Module):
         valid_sum = valid.sum(dim=1).clamp(min=1.0)
         return (loss_token * valid).sum(dim=1) / valid_sum
 
+    def _sigma_from_timestep(self, timestep: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        sigma = (timestep / float(self.train_representation_scheduler.num_train_timesteps)).to(
+            device=target.device,
+            dtype=target.dtype,
+        )
+        return sigma.view(-1, *([1] * (target.ndim - 1)))
+
+    def _representation_training_target(
+        self,
+        *,
+        representation_latents: torch.Tensor,
+        noise_repr: torch.Tensor,
+        noisy_repr: torch.Tensor,
+        timestep_repr: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.representation_prediction_type == "velocity":
+            return self.train_representation_scheduler.training_target(
+                representation_latents,
+                noise_repr,
+                timestep_repr,
+            )
+        del noise_repr, noisy_repr, timestep_repr
+        return representation_latents
+
+    def _compute_representation_prediction_loss_per_sample(
+        self,
+        *,
+        pred_repr: torch.Tensor,
+        target_repr: torch.Tensor,
+        clean_repr: torch.Tensor,
+        noisy_repr: torch.Tensor,
+        noise_repr: torch.Tensor,
+        timestep_repr: torch.Tensor,
+        image_is_pad: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.representation_prediction_type == "x" and self.representation_x_loss_mode == "velocity_equivalent":
+            sigma = self._sigma_from_timestep(timestep_repr, pred_repr).clamp_min(self.representation_t_eps)
+            pred_for_loss = (noisy_repr - pred_repr) / sigma
+            target_for_loss = noise_repr - clean_repr
+        else:
+            pred_for_loss = pred_repr
+            target_for_loss = target_repr
+        return self._compute_representation_loss_per_sample(
+            pred_repr=pred_for_loss,
+            target_repr=target_for_loss,
+            image_is_pad=image_is_pad,
+            include_initial_step=False,
+        )
+
+    @staticmethod
+    def _safe_scalar(value: torch.Tensor) -> float:
+        return float(value.detach().float().mean().item())
+
+    def _representation_monitor_metrics(
+        self,
+        *,
+        representation_latents: torch.Tensor,
+        clean_future: torch.Tensor,
+        noisy_future: torch.Tensor,
+        noise_future: torch.Tensor,
+        pred_repr: torch.Tensor,
+        target_repr: torch.Tensor,
+        timestep_repr: torch.Tensor,
+        loss_repr_raw: torch.Tensor,
+        loss_repr: torch.Tensor,
+    ) -> dict[str, float]:
+        metrics = {
+            "repr/target_mean": self._safe_scalar(clean_future.mean()),
+            "repr/target_std": self._safe_scalar(clean_future.std()),
+            "repr/target_norm": self._safe_scalar(clean_future.float().pow(2).mean(dim=(1, 2, 3, 4)).sqrt()),
+            "repr/noise_norm": self._safe_scalar(noise_future.float().pow(2).mean(dim=(1, 2, 3, 4)).sqrt()),
+            "repr/noisy_norm": self._safe_scalar(noisy_future.float().pow(2).mean(dim=(1, 2, 3, 4)).sqrt()),
+            "repr/pred_norm": self._safe_scalar(pred_repr.float().pow(2).mean(dim=(1, 2, 3, 4)).sqrt()),
+            "repr/loss_raw": float(loss_repr_raw.detach().float().item()),
+            "repr/loss_weighted": float(loss_repr.detach().float().item()),
+            "repr/sigma_mean": self._safe_scalar(timestep_repr.float() / float(self.train_representation_scheduler.num_train_timesteps)),
+            "repr/shift": float(self.train_representation_scheduler.shift),
+        }
+        if int(representation_latents.shape[2]) > 1:
+            delta = representation_latents[:, :, 1:] - representation_latents[:, :, :-1]
+            metrics["repr/delta_norm"] = self._safe_scalar(delta.float().pow(2).mean(dim=(1, 2, 3, 4)).sqrt())
+        if self.representation_prediction_type == "x":
+            metrics["repr/x_mse"] = self._safe_scalar(F.mse_loss(pred_repr.float(), clean_future.float(), reduction="none"))
+        if self.representation_prediction_type == "x" and self.representation_x_loss_mode == "velocity_equivalent":
+            sigma = self._sigma_from_timestep(timestep_repr, pred_repr).clamp_min(self.representation_t_eps)
+            v_pred = (noisy_future - pred_repr) / sigma
+            v_target = noise_future - clean_future
+            metrics["repr/v_equiv_mse"] = self._safe_scalar(F.mse_loss(v_pred.float(), v_target.float(), reduction="none"))
+        else:
+            del target_repr
+        return metrics
+
     def training_loss(self, sample, tiled: bool = False):
         del tiled
         inputs = self.build_inputs(sample)
@@ -742,7 +939,12 @@ class RA(nn.Module):
             dtype=representation_latents.dtype,
         )
         noisy_repr = self.train_representation_scheduler.add_noise(representation_latents, noise_repr, timestep_repr)
-        target_repr = self.train_representation_scheduler.training_target(representation_latents, noise_repr, timestep_repr)
+        target_repr = self._representation_training_target(
+            representation_latents=representation_latents,
+            noise_repr=noise_repr,
+            noisy_repr=noisy_repr,
+            timestep_repr=timestep_repr,
+        )
         noisy_repr[:, :, 0:1] = inputs["first_frame_latents"]
 
         noise_action = torch.randn_like(action)
@@ -805,19 +1007,26 @@ class RA(nn.Module):
 
         pred_repr = pred_repr[:, :, 1:]
         target_repr = target_repr[:, :, 1:]
+        clean_future = representation_latents[:, :, 1:]
+        noisy_future = noisy_repr[:, :, 1:]
+        noise_future = noise_repr[:, :, 1:]
         self._maybe_store_representation_visualization(
             pred_repr=pred_repr,
-            target_repr=target_repr,
+            target_repr=clean_future if self.representation_prediction_type == "x" else target_repr,
         )
-        loss_repr_per_sample = self._compute_representation_loss_per_sample(
+        loss_repr_per_sample = self._compute_representation_prediction_loss_per_sample(
             pred_repr=pred_repr,
             target_repr=target_repr,
+            clean_repr=clean_future,
+            noisy_repr=noisy_future,
+            noise_repr=noise_future,
+            timestep_repr=timestep_repr,
             image_is_pad=image_is_pad,
-            include_initial_step=False,
         )
         repr_weight = self.train_representation_scheduler.training_weight(timestep_repr).to(
             loss_repr_per_sample.device, dtype=loss_repr_per_sample.dtype
         )
+        loss_repr_raw = loss_repr_per_sample.mean()
         loss_repr = (loss_repr_per_sample * repr_weight).mean()
 
         action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2)
@@ -837,6 +1046,19 @@ class RA(nn.Module):
             "loss_representation": self.loss_lambda_representation * float(loss_repr.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
         }
+        loss_dict.update(
+            self._representation_monitor_metrics(
+                representation_latents=representation_latents,
+                clean_future=clean_future,
+                noisy_future=noisy_future,
+                noise_future=noise_future,
+                pred_repr=pred_repr,
+                target_repr=target_repr,
+                timestep_repr=timestep_repr,
+                loss_repr_raw=loss_repr_raw,
+                loss_repr=loss_repr,
+            )
+        )
         return loss_total, loss_dict
 
     @torch.no_grad()
@@ -957,7 +1179,7 @@ class RA(nn.Module):
             "mot": self.mot.state_dict(),
             "step": step,
             "torch_dtype": str(self.torch_dtype),
-            "model_class": "RA",
+            "model_class": self.__class__.__name__,
         }
         if self.proprio_encoder is not None:
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
@@ -980,3 +1202,12 @@ class RA(nn.Module):
         if optimizer is not None and "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])
         return payload
+
+
+class RARAE(RA):
+    """RA with RAEv2-style representation-latent training defaults."""
+
+    def __init__(self, *args, representation_prediction: Optional[dict[str, Any]] = None, **kwargs):
+        if representation_prediction is None:
+            representation_prediction = {"type": "x", "x_loss_mode": "direct", "t_eps": 0.05}
+        super().__init__(*args, representation_prediction=representation_prediction, **kwargs)

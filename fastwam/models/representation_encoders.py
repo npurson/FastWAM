@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Optional
 
 import torch
@@ -293,15 +294,16 @@ class BaseRepresentationEncoder(nn.Module):
 class VGGTRepresentationEncoder(BaseRepresentationEncoder):
     def __init__(
         self,
-        model_id: str = "facebook/VGGT-1B",
+        model_id: str = "facebook/VGGT-Omega",
         model_path: Optional[str] = None,
-        input_size: tuple[int, int] = (420, 728),
-        patch_size: int = 14,
+        input_size: tuple[int, int] = (512, 512),
+        patch_size: int = 16,
         layer_index: int = -1,
         output_dim: int = 2048,
         camera_layout: str = "none",
         num_cameras: int = 1,
-        repo_path: Optional[str] = None,
+        repo_path: Optional[str] = "fastwam/third_party/vggt-omega",
+        checkpoint_strict: bool = False,
     ):
         super().__init__(
             input_size=input_size,
@@ -309,30 +311,99 @@ class VGGTRepresentationEncoder(BaseRepresentationEncoder):
             camera_layout=camera_layout,
             num_cameras=num_cameras,
         )
-        self.model_id = model_path or model_id
+        self.model_id = model_id
+        self.model_path = model_path
         self.patch_size = int(patch_size)
         self.layer_index = int(layer_index)
         self.repo_path = repo_path
+        self.checkpoint_strict = bool(checkpoint_strict)
+
+    def _insert_repo_path(self):
+        import sys
+
+        candidates = []
+        if self.repo_path not in (None, ""):
+            candidates.append(str(self.repo_path))
+        candidates.extend(["fastwam/third_party/vggt-omega", "third_party/vggt-omega"])
+        for candidate in candidates:
+            path = Path(candidate).expanduser()
+            if path.exists():
+                resolved = str(path.resolve())
+                if resolved not in sys.path:
+                    sys.path.insert(0, resolved)
+                return
+
+    def _resolve_checkpoint_path(self) -> Path:
+        candidates = []
+        for value in (self.model_path, self.model_id):
+            if value not in (None, "", "null"):
+                candidates.append(Path(str(value)).expanduser())
+
+        model_leaf = str(self.model_id).rstrip("/").split("/")[-1]
+        for root in ("checkpoints", "fastwam/checkpoints"):
+            candidates.extend(
+                [
+                    Path(root) / str(self.model_id) / "vggt_omega_1b_512.pt",
+                    Path(root) / str(self.model_id) / "model.pt",
+                    Path(root) / model_leaf / "vggt_omega_1b_512.pt",
+                    Path(root) / model_leaf / "model.pt",
+                ]
+            )
+
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_file():
+                return candidate.resolve()
+        raise FileNotFoundError(
+            "VGGT-Omega requires a local checkpoint. Set `encoder.model_path` to "
+            "`vggt_omega_1b_512.pt`, or place it under checkpoints/facebook/VGGT-Omega/."
+        )
+
+    def _checkpoint_state_dict(self, checkpoint_path: Path) -> dict[str, torch.Tensor]:
+        payload = torch.load(checkpoint_path, map_location="cpu")
+        if isinstance(payload, dict):
+            for key in ("state_dict", "model"):
+                if key in payload and isinstance(payload[key], dict):
+                    payload = payload[key]
+                    break
+        if not isinstance(payload, dict):
+            raise TypeError(f"Unexpected VGGT-Omega checkpoint type at {checkpoint_path}: {type(payload)}")
+
+        state_dict = {}
+        for key, value in payload.items():
+            if not isinstance(value, torch.Tensor):
+                continue
+            clean_key = str(key)
+            for prefix in ("module.", "model."):
+                if clean_key.startswith(prefix):
+                    clean_key = clean_key[len(prefix) :]
+            state_dict[clean_key] = value
+        return state_dict
 
     def _load(self, device: torch.device):
         if self.model is not None:
             return
-        if self.repo_path not in (None, ""):
-            import sys
-            from pathlib import Path
-
-            sys.path.insert(0, str(Path(str(self.repo_path)).expanduser().resolve()))
+        self._insert_repo_path()
         try:
-            from vggt.models.vggt import VGGT
-        except Exception:
-            try:
-                from models.vggt import VGGT
-            except Exception as exc:
-                raise ImportError(
-                    "VGGT online extraction requires VGGT to be installed or `encoder.repo_path` to point to a VGGT repo."
-                ) from exc
+            from vggt_omega.models import VGGTOmega
+        except Exception as exc:
+            raise ImportError(
+                "VGGT-Omega online extraction requires `vggt_omega` to be installed, or "
+                "`encoder.repo_path` to point to the VGGT-Omega repo."
+            ) from exc
+
+        checkpoint_path = self._resolve_checkpoint_path()
+        model = VGGTOmega(patch_size=self.patch_size, enable_camera=False, enable_depth=False, enable_alignment=False)
+        load_result = model.load_state_dict(
+            self._checkpoint_state_dict(checkpoint_path),
+            strict=self.checkpoint_strict,
+        )
+        missing_aggregator = [key for key in load_result.missing_keys if key.startswith("aggregator.")]
+        if missing_aggregator:
+            raise ValueError(
+                f"VGGT-Omega checkpoint is missing aggregator weights, e.g. {missing_aggregator[:5]}."
+            )
         self._set_teacher_model(
-            self._freeze_loaded_model(VGGT.from_pretrained(self.model_id).to(**self._model_to_kwargs(device)))
+            self._freeze_loaded_model(model.to(**self._model_to_kwargs(device)))
         )
 
     @torch.inference_mode()
@@ -351,15 +422,15 @@ class VGGTRepresentationEncoder(BaseRepresentationEncoder):
             resized_views.append(rearrange(images, "(b t) c h w -> b t c h w", b=batch_size, t=num_frames))
 
         views = torch.stack(resized_views, dim=2)
-        views = rearrange(views, "b t v c h w -> (b t) v c h w")
+        views = rearrange(views, "b t v c h w -> b (t v) c h w")
         views = self._cast_teacher_input(views)
         tokens = self._forward_tokens(views)
         if tokens.ndim != 4:
-            raise ValueError(f"Expected VGGT multi-view tokens [B*T,V,N,C], got {tuple(tokens.shape)}")
-        if tokens.shape[0] != int(batch_size) * int(num_frames) or tokens.shape[1] != len(camera_videos):
+            raise ValueError(f"Expected VGGT-Omega tokens [B,T*V,N,C], got {tuple(tokens.shape)}")
+        if tokens.shape[0] != int(batch_size) or tokens.shape[1] != int(num_frames) * len(camera_videos):
             raise ValueError(
-                "VGGT token shape mismatch: "
-                f"got {tuple(tokens.shape)}, expected first dims {(int(batch_size) * int(num_frames), len(camera_videos))}."
+                "VGGT-Omega token shape mismatch: "
+                f"got {tuple(tokens.shape)}, expected first dims {(int(batch_size), int(num_frames) * len(camera_videos))}."
             )
 
         feat_h = self.input_size[0] // self.patch_size
@@ -367,13 +438,13 @@ class VGGTRepresentationEncoder(BaseRepresentationEncoder):
         if tokens.shape[2] > feat_h * feat_w:
             tokens = tokens[:, :, -feat_h * feat_w :, :]
         if tokens.shape[2] != feat_h * feat_w:
-            raise ValueError(f"VGGT token count mismatch: got {tokens.shape[2]}, expected {feat_h * feat_w}.")
+            raise ValueError(f"VGGT-Omega token count mismatch: got {tokens.shape[2]}, expected {feat_h * feat_w}.")
 
         maps = rearrange(
             tokens,
-            "(b t) v (h w) c -> b t v c h w",
-            b=int(batch_size),
+            "b (t v) (h w) c -> b t v c h w",
             t=int(num_frames),
+            v=len(camera_videos),
             h=feat_h,
             w=feat_w,
         )
@@ -384,26 +455,25 @@ class VGGTRepresentationEncoder(BaseRepresentationEncoder):
         return self.merge_camera_features(camera_features)
 
     def _forward_tokens(self, views: torch.Tensor) -> torch.Tensor:
-        tokens_list, _ = self.model.aggregator(views)
+        tokens_list, patch_token_start = self.model.aggregator(views)
         tokens = tokens_list[self.layer_index]
         if tokens is None:
             available = [idx for idx, item in enumerate(tokens_list) if item is not None]
             raise ValueError(
-                f"VGGT layer_index={self.layer_index} was not cached. "
+                f"VGGT-Omega layer_index={self.layer_index} was not cached. "
                 f"Available cached layer indices: {available}"
             )
-        return tokens
+        return tokens[:, :, patch_token_start:].contiguous()
 
     @torch.inference_mode()
     def forward_camera_dense(self, video: torch.Tensor) -> torch.Tensor:
         self._load(video.device)
         images, batch_size, num_frames = self._video_to_images(video)
         images = self._cast_teacher_input(images)
-        tokens = self._forward_tokens(images.unsqueeze(1))
-        if tokens.ndim == 4:
-            tokens = tokens[:, 0]
-        elif tokens.ndim != 3:
-            raise ValueError(f"Unexpected VGGT token shape: {tuple(tokens.shape)}")
+        views = rearrange(images, "(b t) c h w -> b t c h w", b=batch_size, t=num_frames)
+        tokens = self._forward_tokens(views)
+        if tokens.ndim != 4:
+            raise ValueError(f"Unexpected VGGT-Omega token shape: {tuple(tokens.shape)}")
         h = self.input_size[0] // self.patch_size
         w = self.input_size[1] // self.patch_size
         return self._tokens_to_dense(
@@ -412,7 +482,7 @@ class VGGTRepresentationEncoder(BaseRepresentationEncoder):
             num_frames=num_frames,
             feat_h=h,
             feat_w=w,
-            teacher_name="VGGT",
+            teacher_name="VGGT-Omega",
         )
 
 
@@ -495,6 +565,69 @@ class DINORepresentationEncoder(BaseRepresentationEncoder):
             feat_h=feat_h,
             feat_w=feat_w,
             teacher_name="DINO",
+        )
+
+
+class DINOMultiLayerSumRepresentationEncoder(DINORepresentationEncoder):
+    """DINO/DINOv3 dense features from a sum of normalized intermediate layers."""
+
+    def __init__(
+        self,
+        *args,
+        layers: Optional[list[int]] = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if layers in (None, [], ""):
+            layers = [11, 13, 15, 17, 19, 21, 23]
+        self.layers = [int(layer) for layer in layers]
+        if not self.layers:
+            raise ValueError("DINO multi-layer-sum requires at least one layer index.")
+
+    @torch.no_grad()
+    def forward_camera_dense(self, video: torch.Tensor) -> torch.Tensor:
+        self._load(video.device)
+        images, batch_size, num_frames = self._video_to_images(video)
+        images = self._normalize_imagenet(images)
+        feat_h = self.input_size[0] // self.patch_size
+        feat_w = self.input_size[1] // self.patch_size
+        spatial_tokens = feat_h * feat_w
+
+        if self.backend != "hub":
+            raise ValueError("DINO multi-layer-sum currently requires backend='hub' with get_intermediate_layers.")
+        if not hasattr(self.model, "get_intermediate_layers"):
+            raise ValueError("DINO model does not expose `get_intermediate_layers`, required for multi-layer-sum.")
+
+        outputs = self.model.get_intermediate_layers(
+            images,
+            n=self.layers,
+            reshape=False,
+            return_class_token=False,
+            norm=True,
+        )
+        if isinstance(outputs, torch.Tensor):
+            outputs = [outputs]
+        if not isinstance(outputs, (list, tuple)) or not outputs:
+            raise ValueError("DINO get_intermediate_layers returned no tensor outputs.")
+        layer_tokens = []
+        for output in outputs:
+            if isinstance(output, (list, tuple)):
+                output = output[0]
+            if not isinstance(output, torch.Tensor):
+                raise ValueError(f"Unexpected DINO intermediate output type: {type(output)!r}.")
+            if output.ndim != 3:
+                raise ValueError(f"DINO intermediate output must be [B,N,C], got {tuple(output.shape)}.")
+            if output.shape[1] > spatial_tokens:
+                output = output[:, -spatial_tokens:, :]
+            layer_tokens.append(output)
+        tokens = torch.stack(layer_tokens, dim=0).sum(dim=0)
+        return self._tokens_to_dense(
+            tokens,
+            batch_size=batch_size,
+            num_frames=num_frames,
+            feat_h=feat_h,
+            feat_w=feat_w,
+            teacher_name="DINO-MLS",
         )
 
 
@@ -655,10 +788,12 @@ def build_representation_encoder(cfg: dict[str, Any]) -> BaseRepresentationEncod
     ).lower()
     if "feature_dim" in cfg and "output_dim" not in encoder_cfg:
         encoder_cfg["output_dim"] = int(cfg["feature_dim"])
-    if name == "vggt":
+    if name in {"vggt", "vggt_omega", "vggt-omega"}:
         return VGGTRepresentationEncoder(**encoder_cfg)
     if name == "dino":
         return DINORepresentationEncoder(**encoder_cfg)
+    if name in {"dino_mls", "dinomls", "dinov3_mls", "dinov3mls"}:
+        return DINOMultiLayerSumRepresentationEncoder(**encoder_cfg)
     if name == "vjepa":
         return VJEPARepresentationEncoder(**encoder_cfg)
     raise ValueError(f"Unsupported representation encoder: {name}")

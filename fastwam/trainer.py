@@ -783,12 +783,14 @@ class Wan22Trainer:
                         metrics = self.evaluate()
                         self.accelerator.wait_for_everyone()
                         if metrics is not None and self.accelerator.is_main_process:
-                            description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
+                            description = "[eval] step=%d val_loss=%.4f" % (
                                 self.global_step,
                                 metrics["val_loss"],
-                                metrics["psnr_rd"],
-                                metrics["ssim_rd"],
                             )
+                            if "psnr_rd" in metrics:
+                                description += " infer_psnr=%.4f" % metrics["psnr_rd"]
+                            if "ssim_rd" in metrics:
+                                description += " infer_ssim=%.4f" % metrics["ssim_rd"]
                             if "action_l2" in metrics:
                                 description += " action_l2=%.4f" % metrics["action_l2"]
                             if "action_l1" in metrics:
@@ -796,17 +798,19 @@ class Wan22Trainer:
                             logger.info(description)
                             eval_payload = {
                                 "eval/val_loss": float(metrics["val_loss"]),
-                                "eval/psnr_rg": float(metrics["psnr_rg"]),
-                                "eval/ssim_rg": float(metrics["ssim_rg"]),
-                                "eval/psnr_rd": float(metrics["psnr_rd"]),
-                                "eval/ssim_rd": float(metrics["ssim_rd"]),
-                                "eval/psnr_dg": float(metrics["psnr_dg"]),
-                                "eval/ssim_dg": float(metrics["ssim_dg"]),
                             }
-                            if "action_l2" in metrics:
-                                eval_payload["eval/action_l2"] = float(metrics["action_l2"])
-                            if "action_l1" in metrics:
-                                eval_payload["eval/action_l1"] = float(metrics["action_l1"])
+                            for key in (
+                                "psnr_rg",
+                                "ssim_rg",
+                                "psnr_rd",
+                                "ssim_rd",
+                                "psnr_dg",
+                                "ssim_dg",
+                                "action_l2",
+                                "action_l1",
+                            ):
+                                if key in metrics:
+                                    eval_payload[f"eval/{key}"] = float(metrics[key])
                             self._wandb_log(eval_payload)
                             self._tensorboard_log(eval_payload)
                             if "video_tensor" in metrics:

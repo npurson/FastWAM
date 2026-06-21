@@ -32,15 +32,19 @@ representation_forcing:
   #   stats_path: null
   #   fit_on_the_fly: false
 
-  ## VGGT
+  ## VGGT-Omega
   target_temporal_indices: [0, 3, 7]
   target_temporal_groups: null
   encoder:
-    name: vggt
+    name: vggt_omega
     camera_layout: robotwin
     num_cameras: 3
-    model_id: facebook/VGGT-1B
-    input_size: [224, 280]
+    model_id: facebook/VGGT-Omega
+    model_path: /horizon-bucket/robot_lab/users/zhengyu.zou-labs/ckpt/vggt-omega/vggt_omega_1b_512.pt
+    repo_path: fastwam/third_party/vggt-omega
+    input_size: [256, 320]
+    patch_size: 16
+    layer_index: -1
     output_dim: 2048
 
   ## DINO

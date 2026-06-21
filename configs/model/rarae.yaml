@@ -1,4 +1,4 @@
-_target_: fastwam.runtime.create_ra
+_target_: fastwam.runtime.create_rarae
 model_id: Wan-AI/Wan2.2-TI2V-5B
 tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
 tokenizer_max_len: 128
@@ -11,32 +11,15 @@ skip_dit_load_from_pretrain: false
 
 representation:
   target_dim: ${model.representation.encoder.output_dim}
-  # Indices over RobotWin's already sampled 9-frame video sequence.
-  # [0,4,8] means online teacher only encodes original steps [0,16,32].
-  temporal_align_mode: strict
-  latent_spatial_size: [12, 10]
-  normalize_target: false
-
-  ## VGGT-Omega
-  # temporal_indices: [0, 2, 4, 6, 8]
-  # temporal_groups: null
-  # encoder:
-  #   name: vggt_omega
-  #   camera_layout: robotwin
-  #   num_cameras: 3
-  #   model_id: facebook/VGGT-Omega
-  #   model_path: /horizon-bucket/robot_lab/users/zhengyu.zou-labs/ckpt/vggt-omega/vggt_omega_1b_512.pt
-  #   repo_path: fastwam/third_party/vggt-omega
-  #   input_size: [256, 320]
-  #   patch_size: 16
-  #   layer_index: -1
-  #   output_dim: 2048
-
-  ## DINOv3
   temporal_indices: [0, 2, 4, 6, 8]
   temporal_groups: null
+  temporal_align_mode: strict
+  latent_spatial_size: [12, 10]
+  normalize_target: true
+  latent_stats_path: null
+  latent_stats_eps: 1.0e-05
   encoder:
-    name: dino
+    name: dino_mls
     backend: hub
     hub_repo: facebookresearch/dinov3:main
     hub_source: github
@@ -46,34 +29,20 @@ representation:
     input_size: [384, 384]
     patch_size: 16
     output_dim: 1024
+    layers: [11, 13, 15, 17, 19, 21, 23]
     camera_layout: robotwin
     num_cameras: 3
 
-  ## V-JEPA
-  # temporal_indices: null
-  # temporal_groups:
-  #   - [0, 0]
-  #   - [1, 2]
-  #   - [4, 5]
-  #   - [7, 8]
-  # encoder:
-  #   name: vjepa
-  #   backend: hub
-  #   hub_repo: facebookresearch/vjepa2:main
-  #   hub_model_name: vjepa2_1_vit_large_384
-  #   model_id: ""
-  #   hub_source: github
-  #   hub_kwargs: {}
-  #   input_layout: bcthw
-  #   input_size: [384, 384]
-  #   patch_size: 16
-  #   output_dim: 1024
-  #   camera_layout: robotwin
-  #   num_cameras: 3
+representation_prediction:
+  type: x
+  x_loss_mode: velocity_equivalent
+  t_eps: 0.05
 
 representation_dit_config:
   has_image_input: false
-  patch_size: [1, 2, 2]
+  # RARAE keeps the full high-dimensional representation grid instead of
+  # spatially compressing it with the RA default [1, 2, 2] patch.
+  patch_size: [1, 1, 1]
   in_dim: ${model.representation.target_dim}
   hidden_dim: 2048
   ffn_dim: 8192
@@ -104,8 +73,10 @@ action_dit_config:
   use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
 
 representation_scheduler:
-  train_shift: 5.0
-  infer_shift: 5.0
+  train_shift: auto
+  infer_shift: auto
+  shift_base_dim: 4096
+  shift_scope: future_tokens
   num_train_timesteps: 1000
 
 action_scheduler:
