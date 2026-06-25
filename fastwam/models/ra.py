@@ -11,7 +11,7 @@ from fastwam.models.helpers.io import ModelConfig, load_state_dict
 from fastwam.models.mot import MoT
 from fastwam.models.representation_encoders import build_representation_encoder
 from fastwam.models.schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
-from fastwam.models.wan22.wan_video_dit import WanVideoDiT
+from fastwam.models.wan22.wan_video_dit import WanVideoDiT, create_group_causal_attn_mask
 from fastwam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -165,6 +165,7 @@ class RA(nn.Module):
         loss_lambda_action: float = 1.0,
         representation: Optional[dict[str, Any]] = None,
         representation_prediction: Optional[dict[str, Any]] = None,
+        mot_conditioning: Optional[dict[str, Any]] = None,
     ):
         super().__init__()
         self.representation_expert = representation_expert
@@ -234,6 +235,12 @@ class RA(nn.Module):
         self.representation_t_eps = float(representation_prediction.get("t_eps", 0.05))
         if self.representation_t_eps <= 0:
             raise ValueError(f"representation_prediction.t_eps must be positive, got {self.representation_t_eps}.")
+        self.representation_state_space = str(representation_prediction.get("state_space", "absolute")).lower()
+        if self.representation_state_space not in {"absolute", "delta"}:
+            raise ValueError(
+                "representation_prediction.state_space must be one of {'absolute', 'delta'}, "
+                f"got {self.representation_state_space!r}."
+            )
 
         self.target_dim = int(
             representation.get(
@@ -310,6 +317,16 @@ class RA(nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_representation = float(loss_lambda_representation)
         self.loss_lambda_action = float(loss_lambda_action)
+        mot_conditioning = _as_plain_dict(mot_conditioning)
+        action_to_world = _as_plain_dict(mot_conditioning.get("action_to_world", {}))
+        self.mot_action_to_world_enabled = bool(action_to_world.get("enabled", False))
+        self.mot_action_to_world_mask_mode = str(action_to_world.get("mask_mode", "group_diagonal"))
+        if self.mot_action_to_world_mask_mode not in {"causal", "group_diagonal"}:
+            raise ValueError(
+                "`mot_conditioning.action_to_world.mask_mode` must be one of "
+                "{'causal', 'group_diagonal'}, "
+                f"got {self.mot_action_to_world_mask_mode!r}."
+            )
 
         self.to(self.device)
         self._freeze_representation_encoder()
@@ -342,6 +359,7 @@ class RA(nn.Module):
         loss_lambda_representation: float = 1.0,
         loss_lambda_action: float = 1.0,
         representation_prediction: Optional[dict[str, Any]] = None,
+        mot_conditioning: Optional[dict[str, Any]] = None,
     ) -> "RA":
         representation = _as_plain_dict(representation)
         representation_encoder = build_representation_encoder(representation)
@@ -411,6 +429,7 @@ class RA(nn.Module):
             loss_lambda_action=loss_lambda_action,
             representation=representation,
             representation_prediction=representation_prediction,
+            mot_conditioning=mot_conditioning,
         )
         model.model_paths = {
             "representation_dit": (
@@ -807,6 +826,26 @@ class RA(nn.Module):
         mask[video_seq_len:, video_seq_len:] = True
         first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
         mask[video_seq_len:, :first_frame_tokens] = True
+        if self.mot_action_to_world_enabled and video_seq_len > first_frame_tokens:
+            if video_seq_len % video_tokens_per_frame != 0:
+                raise ValueError(
+                    "`video_seq_len` must be divisible by `video_tokens_per_frame` for DAC mask, "
+                    f"got {video_seq_len} and {video_tokens_per_frame}."
+                )
+            num_video_frames = video_seq_len // video_tokens_per_frame
+            num_future_frames = num_video_frames - 1
+            if action_seq_len % num_future_frames != 0:
+                raise ValueError(
+                    "Action sequence length must be divisible by future world frames for DAC mask, "
+                    f"got action_seq_len={action_seq_len}, future_frames={num_future_frames}."
+                )
+            action_group_mask = create_group_causal_attn_mask(
+                num_temporal_groups=num_future_frames,
+                num_query_per_group=video_tokens_per_frame,
+                num_key_per_group=action_seq_len // num_future_frames,
+                mode=self.mot_action_to_world_mask_mode,
+            ).to(device=device)
+            mask[first_frame_tokens:video_seq_len, video_seq_len:] = action_group_mask
         return mask
 
     def _compute_representation_loss_per_sample(
@@ -853,6 +892,24 @@ class RA(nn.Module):
         del noise_repr, noisy_repr, timestep_repr
         return representation_latents
 
+    def _representation_diffusion_latents(self, representation_latents: torch.Tensor) -> torch.Tensor:
+        if self.representation_state_space == "absolute":
+            return representation_latents
+        current_repr = representation_latents[:, :, 0:1]
+        return representation_latents - current_repr
+
+    def _prediction_to_clean_state(
+        self,
+        *,
+        pred_repr: torch.Tensor,
+        noisy_repr: torch.Tensor,
+        timestep_repr: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.representation_prediction_type == "x":
+            return pred_repr
+        sigma = self._sigma_from_timestep(timestep_repr, pred_repr)
+        return noisy_repr - sigma * pred_repr
+
     def _compute_representation_prediction_loss_per_sample(
         self,
         *,
@@ -894,6 +951,7 @@ class RA(nn.Module):
         timestep_repr: torch.Tensor,
         loss_repr_raw: torch.Tensor,
         loss_repr: torch.Tensor,
+        absolute_future: Optional[torch.Tensor] = None,
     ) -> dict[str, float]:
         metrics = {
             "repr/target_mean": self._safe_scalar(clean_future.mean()),
@@ -906,10 +964,15 @@ class RA(nn.Module):
             "repr/loss_weighted": float(loss_repr.detach().float().item()),
             "repr/sigma_mean": self._safe_scalar(timestep_repr.float() / float(self.train_representation_scheduler.num_train_timesteps)),
             "repr/shift": float(self.train_representation_scheduler.shift),
+            "repr/state_space_delta": float(self.representation_state_space == "delta"),
         }
         if int(representation_latents.shape[2]) > 1:
             delta = representation_latents[:, :, 1:] - representation_latents[:, :, :-1]
             metrics["repr/delta_norm"] = self._safe_scalar(delta.float().pow(2).mean(dim=(1, 2, 3, 4)).sqrt())
+        if absolute_future is not None and self.representation_state_space == "delta":
+            metrics["repr/absolute_target_norm"] = self._safe_scalar(
+                absolute_future.float().pow(2).mean(dim=(1, 2, 3, 4)).sqrt()
+            )
         if self.representation_prediction_type == "x":
             metrics["repr/x_mse"] = self._safe_scalar(F.mse_loss(pred_repr.float(), clean_future.float(), reduction="none"))
         if self.representation_prediction_type == "x" and self.representation_x_loss_mode == "velocity_equivalent":
@@ -932,19 +995,26 @@ class RA(nn.Module):
         action_is_pad = inputs["action_is_pad"]
         image_is_pad = inputs["image_is_pad"]
 
-        noise_repr = torch.randn_like(representation_latents)
+        representation_diffusion_latents = self._representation_diffusion_latents(representation_latents)
+        noise_repr = torch.randn_like(representation_diffusion_latents)
         timestep_repr = self.train_representation_scheduler.sample_training_t(
             batch_size=batch_size,
             device=self.device,
-            dtype=representation_latents.dtype,
+            dtype=representation_diffusion_latents.dtype,
         )
-        noisy_repr = self.train_representation_scheduler.add_noise(representation_latents, noise_repr, timestep_repr)
+        noisy_repr = self.train_representation_scheduler.add_noise(
+            representation_diffusion_latents,
+            noise_repr,
+            timestep_repr,
+        )
         target_repr = self._representation_training_target(
-            representation_latents=representation_latents,
+            representation_latents=representation_diffusion_latents,
             noise_repr=noise_repr,
             noisy_repr=noisy_repr,
             timestep_repr=timestep_repr,
         )
+        # Keep the observation token absolute even for delta-state prediction; the
+        # future tokens carry the noisy delta state.
         noisy_repr[:, :, 0:1] = inputs["first_frame_latents"]
 
         noise_action = torch.randn_like(action)
@@ -961,7 +1031,7 @@ class RA(nn.Module):
             timestep=timestep_repr,
             context=context,
             context_mask=context_mask,
-            action=None,
+            action=action if bool(getattr(self.representation_expert, "action_conditioned", False)) else None,
             fuse_vae_embedding_in_latents=True,
         )
         action_pre = self.action_expert.pre_dit(
@@ -1007,12 +1077,24 @@ class RA(nn.Module):
 
         pred_repr = pred_repr[:, :, 1:]
         target_repr = target_repr[:, :, 1:]
-        clean_future = representation_latents[:, :, 1:]
+        clean_future = representation_diffusion_latents[:, :, 1:]
         noisy_future = noisy_repr[:, :, 1:]
         noise_future = noise_repr[:, :, 1:]
-        self._maybe_store_representation_visualization(
+        absolute_future = representation_latents[:, :, 1:]
+        clean_pred_for_viz = self._prediction_to_clean_state(
             pred_repr=pred_repr,
-            target_repr=clean_future if self.representation_prediction_type == "x" else target_repr,
+            noisy_repr=noisy_future,
+            timestep_repr=timestep_repr,
+        )
+        if self.representation_state_space == "delta":
+            viz_pred = representation_latents[:, :, 0:1] + clean_pred_for_viz
+            viz_target = absolute_future
+        else:
+            viz_pred = clean_pred_for_viz
+            viz_target = clean_future
+        self._maybe_store_representation_visualization(
+            pred_repr=viz_pred,
+            target_repr=viz_target,
         )
         loss_repr_per_sample = self._compute_representation_prediction_loss_per_sample(
             pred_repr=pred_repr,
@@ -1045,6 +1127,10 @@ class RA(nn.Module):
         loss_dict = {
             "loss_representation": self.loss_lambda_representation * float(loss_repr.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+            "conditioning/action_enabled": float(
+                bool(getattr(self.representation_expert, "action_conditioned", False))
+            ),
+            "conditioning/mot_action_to_world_enabled": float(self.mot_action_to_world_enabled),
         }
         loss_dict.update(
             self._representation_monitor_metrics(
@@ -1057,6 +1143,7 @@ class RA(nn.Module):
                 timestep_repr=timestep_repr,
                 loss_repr_raw=loss_repr_raw,
                 loss_repr=loss_repr,
+                absolute_future=absolute_future,
             )
         )
         return loss_total, loss_dict

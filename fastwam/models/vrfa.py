@@ -360,6 +360,7 @@ class VrfA(FastWAM):
         loss_dict = {
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+            "conditioning/action_enabled": float(bool(getattr(self.video_expert, "action_conditioned", False))),
         }
         if repr_loss_dict:
             for key, value in repr_loss_dict.items():

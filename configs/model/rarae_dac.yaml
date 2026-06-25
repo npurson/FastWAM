@@ -1,0 +1,8 @@
+defaults:
+  - rarae
+  - _self_
+
+mot_conditioning:
+  action_to_world:
+    enabled: true
+    mask_mode: group_diagonal

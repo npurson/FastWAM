@@ -86,6 +86,39 @@ def _as_resolved_dict(value, name: str, *, default=None, required: bool = False)
     return value
 
 
+def _enable_action_conditioning_if_requested(
+    dit_config: dict,
+    world_conditioning=None,
+    *,
+    action_dim: int | None = None,
+):
+    world_conditioning = _as_resolved_dict(
+        world_conditioning,
+        "world_conditioning",
+        default={},
+    )
+    action_cfg = world_conditioning.get("action", {})
+    if isinstance(action_cfg, DictConfig):
+        action_cfg = OmegaConf.to_container(action_cfg, resolve=True)
+    if action_cfg is None:
+        action_cfg = {}
+    if not isinstance(action_cfg, dict):
+        raise ValueError(f"`world_conditioning.action` must be a dict, got {type(action_cfg)}")
+    if not bool(action_cfg.get("enabled", False)):
+        return dit_config
+
+    dit_config["action_conditioned"] = True
+    dit_config["action_group_causal_mask_mode"] = str(
+        action_cfg.get(
+            "mask_mode",
+            dit_config.get("action_group_causal_mask_mode", "group_diagonal"),
+        )
+    )
+    if action_dim is not None:
+        dit_config["action_dim"] = int(action_dim)
+    return dit_config
+
+
 def _validate_action_scheduler(action_scheduler: dict, model_name: str):
     required_keys = {"train_shift", "infer_shift", "num_train_timesteps"}
     missing_keys = required_keys - set(action_scheduler.keys())
@@ -173,6 +206,8 @@ def _fastwam_pretrained_kwargs(
     action_scheduler,
     loss,
     mot_checkpoint_mixed_attn: bool,
+    world_conditioning=None,
+    mot_conditioning=None,
     redirect_common_files: bool,
     model_dtype: torch.dtype,
     device: str,
@@ -180,6 +215,11 @@ def _fastwam_pretrained_kwargs(
 ):
     video_dit_config = _as_resolved_dict(video_dit_config, "video_dit_config", required=True)
     action_dit_config = _as_resolved_dict(action_dit_config, "action_dit_config")
+    video_dit_config = _enable_action_conditioning_if_requested(
+        video_dit_config,
+        world_conditioning,
+        action_dim=action_dit_config.get("action_dim"),
+    )
     video_scheduler = _as_resolved_dict(video_scheduler, "video_scheduler")
     action_scheduler = _as_resolved_dict(action_scheduler, "action_scheduler", required=True)
     loss = _as_resolved_dict(loss, "loss")
@@ -207,6 +247,11 @@ def _fastwam_pretrained_kwargs(
         "action_num_train_timesteps": int(action_scheduler["num_train_timesteps"]),
         "loss_lambda_video": float(loss.get("lambda_video", 1.0)),
         "loss_lambda_action": float(loss.get("lambda_action", 1.0)),
+        "mot_conditioning": _as_resolved_dict(
+            mot_conditioning,
+            "mot_conditioning",
+            default={},
+        ),
     }
 
 
@@ -224,6 +269,8 @@ def create_fastwam(
     action_scheduler=None,
     loss=None,
     mot_checkpoint_mixed_attn: bool = True,
+    world_conditioning=None,
+    mot_conditioning=None,
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
@@ -245,6 +292,8 @@ def create_fastwam(
             action_scheduler=action_scheduler,
             loss=loss,
             mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
+            world_conditioning=world_conditioning,
+            mot_conditioning=mot_conditioning,
             redirect_common_files=redirect_common_files,
             model_dtype=model_dtype,
             device=device,
@@ -268,6 +317,8 @@ def create_vrfa(
     loss=None,
     representation_forcing=None,
     mot_checkpoint_mixed_attn: bool = True,
+    world_conditioning=None,
+    mot_conditioning=None,
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
@@ -291,6 +342,8 @@ def create_vrfa(
             action_scheduler=action_scheduler,
             loss=loss,
             mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
+            world_conditioning=world_conditioning,
+            mot_conditioning=mot_conditioning,
             redirect_common_files=redirect_common_files,
             model_dtype=model_dtype,
             device=device,
@@ -321,6 +374,8 @@ def create_ra(
     loss=None,
     representation=None,
     mot_checkpoint_mixed_attn: bool = True,
+    world_conditioning=None,
+    mot_conditioning=None,
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
@@ -334,6 +389,11 @@ def create_ra(
         required=True,
     )
     action_dit_config = _as_resolved_dict(action_dit_config, "action_dit_config")
+    representation_dit_config = _enable_action_conditioning_if_requested(
+        representation_dit_config,
+        world_conditioning,
+        action_dim=action_dit_config.get("action_dim"),
+    )
     representation_scheduler = _as_resolved_dict(representation_scheduler, "representation_scheduler")
     action_scheduler = _as_resolved_dict(action_scheduler, "action_scheduler", required=True)
     loss = _as_resolved_dict(loss, "loss")
@@ -374,6 +434,11 @@ def create_ra(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_representation=float(loss.get("lambda_representation", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        mot_conditioning=_as_resolved_dict(
+            mot_conditioning,
+            "mot_conditioning",
+            default={},
+        ),
     )
     model.model_paths.update(
         {
@@ -404,6 +469,8 @@ def create_rarae(
     representation=None,
     representation_prediction=None,
     mot_checkpoint_mixed_attn: bool = True,
+    world_conditioning=None,
+    mot_conditioning=None,
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
@@ -418,6 +485,11 @@ def create_rarae(
         required=True,
     )
     action_dit_config = _as_resolved_dict(action_dit_config, "action_dit_config")
+    representation_dit_config = _enable_action_conditioning_if_requested(
+        representation_dit_config,
+        world_conditioning,
+        action_dim=action_dit_config.get("action_dim"),
+    )
     representation_scheduler = _as_resolved_dict(representation_scheduler, "representation_scheduler")
     action_scheduler = _as_resolved_dict(action_scheduler, "action_scheduler", required=True)
     loss = _as_resolved_dict(loss, "loss")
@@ -483,6 +555,11 @@ def create_rarae(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_representation=float(loss.get("lambda_representation", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        mot_conditioning=_as_resolved_dict(
+            mot_conditioning,
+            "mot_conditioning",
+            default={},
+        ),
     )
     model.model_paths.update(
         {
