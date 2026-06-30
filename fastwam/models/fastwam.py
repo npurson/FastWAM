@@ -10,23 +10,14 @@ from fastwam.utils.logging_config import get_logger
 from .action_dit import ActionDiT
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
+from .mot_utils import (
+    build_world_action_mot_mask,
+    compute_action_flow_loss,
+    parse_mot_action_to_world_config,
+)
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
-from .wan22.wan_video_dit import create_group_causal_attn_mask
 
 logger = get_logger(__name__)
-
-
-def _as_plain_dict(value: Any) -> dict[str, Any]:
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return dict(value)
-    try:
-        from omegaconf import OmegaConf
-
-        return OmegaConf.to_container(value, resolve=True)
-    except Exception:
-        return dict(value)
 
 
 class FastWAM(torch.nn.Module):
@@ -99,16 +90,8 @@ class FastWAM(torch.nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
-        mot_conditioning = _as_plain_dict(mot_conditioning)
-        action_to_world = _as_plain_dict(mot_conditioning.get("action_to_world", {}))
-        self.mot_action_to_world_enabled = bool(action_to_world.get("enabled", False))
-        self.mot_action_to_world_mask_mode = str(action_to_world.get("mask_mode", "group_diagonal"))
-        if self.mot_action_to_world_mask_mode not in {"causal", "group_diagonal"}:
-            raise ValueError(
-                "`mot_conditioning.action_to_world.mask_mode` must be one of "
-                "{'causal', 'group_diagonal'}, "
-                f"got {self.mot_action_to_world_mask_mode!r}."
-            )
+        self.mot_action_to_world = parse_mot_action_to_world_config(mot_conditioning)
+        self.mot_action_to_world_enabled = self.mot_action_to_world.enabled
 
         self.to(self.device)
 
@@ -420,41 +403,14 @@ class FastWAM(torch.nn.Module):
         video_tokens_per_frame: int,
         device: torch.device,
     ) -> torch.Tensor:
-        total_seq_len = video_seq_len + action_seq_len
-        mask = torch.zeros((total_seq_len, total_seq_len), dtype=torch.bool, device=device)
-
-        # video -> video
-        mask[:video_seq_len, :video_seq_len] = self.video_expert.build_video_to_video_mask(
-            video_seq_len=video_seq_len,
-            video_tokens_per_frame=video_tokens_per_frame,
+        return build_world_action_mot_mask(
+            world_expert=self.video_expert,
+            world_seq_len=video_seq_len,
+            action_seq_len=action_seq_len,
+            world_tokens_per_frame=video_tokens_per_frame,
             device=device,
+            action_to_world=self.mot_action_to_world,
         )
-        # action -> action
-        mask[video_seq_len:, video_seq_len:] = True
-        # action -> first-frame video only
-        first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
-        mask[video_seq_len:, :first_frame_tokens] = True
-        if self.mot_action_to_world_enabled and video_seq_len > first_frame_tokens:
-            if video_seq_len % video_tokens_per_frame != 0:
-                raise ValueError(
-                    "`video_seq_len` must be divisible by `video_tokens_per_frame` for DAC mask, "
-                    f"got {video_seq_len} and {video_tokens_per_frame}."
-                )
-            num_video_frames = video_seq_len // video_tokens_per_frame
-            num_future_frames = num_video_frames - 1
-            if action_seq_len % num_future_frames != 0:
-                raise ValueError(
-                    "Action sequence length must be divisible by future world frames for DAC mask, "
-                    f"got action_seq_len={action_seq_len}, future_frames={num_future_frames}."
-                )
-            action_group_mask = create_group_causal_attn_mask(
-                num_temporal_groups=num_future_frames,
-                num_query_per_group=video_tokens_per_frame,
-                num_key_per_group=action_seq_len // num_future_frames,
-                mode=self.mot_action_to_world_mask_mode,
-            ).to(device=device)
-            mask[first_frame_tokens:video_seq_len, video_seq_len:] = action_group_mask
-        return mask
 
     def _compute_video_loss_per_sample(
         self,
@@ -597,18 +553,13 @@ class FastWAM(torch.nn.Module):
         )
         loss_video = (loss_video_per_sample * video_weight).mean()
 
-        action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2) # [B, T]
-        if action_is_pad is not None:
-            valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
-            valid_sum = valid.sum(dim=1).clamp(min=1.0)
-            action_loss_per_sample = (action_loss_token * valid).sum(dim=1) / valid_sum
-        else:
-            action_loss_per_sample = action_loss_token.mean(dim=1)
-
-        action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
-            action_loss_per_sample.device, dtype=action_loss_per_sample.dtype
+        loss_action = compute_action_flow_loss(
+            pred_action=pred_action,
+            target_action=target_action,
+            action_is_pad=action_is_pad,
+            timestep_action=timestep_action,
+            action_scheduler=self.train_action_scheduler,
         )
-        loss_action = (action_loss_per_sample * action_weight).mean()
 
         loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
         loss_dict = {

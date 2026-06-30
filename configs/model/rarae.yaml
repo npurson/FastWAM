@@ -1,4 +1,4 @@
-_target_: fastwam.runtime.create_rarae
+_target_: fastwam.runtime.create_ra
 model_id: Wan-AI/Wan2.2-TI2V-5B
 tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
 tokenizer_max_len: 128
@@ -37,11 +37,6 @@ representation:
     layers: [11, 13, 15, 17, 19, 21, 23]
     camera_layout: robotwin
     num_cameras: 3
-
-representation_prediction:
-  type: velocity
-  x_loss_mode: velocity_equivalent
-  t_eps: 0.05
 
 representation_dit_config:
   has_image_input: false

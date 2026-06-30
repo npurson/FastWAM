@@ -2,5 +2,5 @@ defaults:
   - rarae
   - _self_
 
-representation_prediction:
+representation:
   state_space: delta
