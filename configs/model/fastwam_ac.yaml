@@ -2,7 +2,7 @@ defaults:
   - fastwam
   - _self_
 
-world_conditioning:
-  action:
+mot_conditioning:
+  action_to_world:
     enabled: true
     mask_mode: group_diagonal

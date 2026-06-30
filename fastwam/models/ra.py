@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
 from typing import Any, Optional, Sequence, Union
 
 import torch
@@ -9,7 +11,10 @@ import torch.nn.functional as F
 from fastwam.models.action_dit import ActionDiT
 from fastwam.models.helpers.io import ModelConfig, load_state_dict
 from fastwam.models.mot import MoT
-from fastwam.models.mot_utils import (
+from .utils import (
+    as_hw,
+    as_optional_path,
+    as_plain_dict,
     build_world_action_mot_mask,
     compute_action_flow_loss,
     parse_mot_action_to_world_config,
@@ -20,35 +25,6 @@ from fastwam.models.wan22.wan_video_dit import WanVideoDiT
 from fastwam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
-
-
-def _as_plain_dict(value: Any) -> dict[str, Any]:
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return dict(value)
-    try:
-        from omegaconf import OmegaConf
-
-        return OmegaConf.to_container(value, resolve=True)
-    except Exception:
-        return dict(value)
-
-
-def _as_hw(value: Any, default: tuple[int, int]) -> tuple[int, int]:
-    if value in (None, "", "null"):
-        return default
-    if isinstance(value, int):
-        return int(value), int(value)
-    if len(value) != 2:
-        raise ValueError(f"Expected 2D spatial size, got {value}.")
-    return int(value[0]), int(value[1])
-
-
-def _as_optional_path(value: Any) -> Optional[str]:
-    if value in (None, "", "null"):
-        return None
-    return str(value)
 
 
 def _parse_temporal_indices(value: Any, name: str, min_steps: int) -> Optional[list[int]]:
@@ -80,6 +56,146 @@ def _parse_temporal_groups(value: Any, name: str, min_steps: int) -> Optional[li
     if groups[0][0] != 0:
         raise ValueError(f"`{name}` must start with frame 0 for first-frame conditioning.")
     return groups
+
+
+@dataclass(frozen=True)
+class RepresentationConfig:
+    state_space: str
+    target_dim: int
+    latent_spatial_size: tuple[int, int]
+    normalize_target_mode: str
+    normalize_target: bool
+    latent_stats_path: Optional[str]
+    latent_stats_eps: float
+    temporal_align_mode: str
+    temporal_groups: Optional[list[list[int]]]
+    temporal_indices: Optional[list[int]]
+
+    @classmethod
+    def from_dict(
+        cls,
+        cfg: Optional[dict[str, Any]],
+        *,
+        default_target_dim: int,
+        default_latent_spatial_size: tuple[int, int] = (12, 10),
+    ) -> "RepresentationConfig":
+        cfg = as_plain_dict(cfg)
+        encoder_cfg = as_plain_dict(cfg.get("encoder", {}))
+
+        state_space = str(cfg.get("state_space", "absolute")).lower()
+        if state_space not in {"absolute", "delta"}:
+            raise ValueError(
+                "representation.state_space must be one of {'absolute', 'delta'}, "
+                f"got {state_space!r}."
+            )
+
+        target_dim = int(
+            cfg.get(
+                "target_dim",
+                encoder_cfg.get("output_dim", default_target_dim),
+            )
+        )
+        latent_spatial_size = as_hw(
+            cfg.get("latent_spatial_size", None),
+            default=default_latent_spatial_size,
+        )
+
+        normalize_target = cfg.get("normalize_target", False)
+        if isinstance(normalize_target, str):
+            normalize_target_mode = normalize_target.lower()
+        else:
+            normalize_target_mode = "per_sample" if bool(normalize_target) else "none"
+        if normalize_target_mode in {"false", "off", "no", "0"}:
+            normalize_target_mode = "none"
+        if normalize_target_mode in {"true", "on", "yes", "1"}:
+            normalize_target_mode = "per_sample"
+        if normalize_target_mode not in {"none", "per_sample", "dataset"}:
+            raise ValueError(
+                "RA representation.normalize_target must be false/true or one of "
+                "{'none', 'per_sample', 'dataset'}, "
+                f"got {normalize_target!r}."
+            )
+
+        temporal_align_mode = str(cfg.get("temporal_align_mode", "strict")).lower()
+        if temporal_align_mode not in {"strict", "interpolate"}:
+            raise ValueError(f"Unsupported RA representation.temporal_align_mode: {temporal_align_mode}")
+
+        temporal_groups = _parse_temporal_groups(
+            cfg.get("temporal_groups", None),
+            "RA representation.temporal_groups",
+            min_steps=2,
+        )
+        temporal_indices = _parse_temporal_indices(
+            cfg.get("temporal_indices", None if temporal_groups is not None else [0, 4, 8]),
+            "RA representation.temporal_indices",
+            min_steps=2,
+        )
+        if temporal_groups is not None and temporal_indices is not None:
+            raise ValueError("Use only one of RA `representation.temporal_indices` and `representation.temporal_groups`.")
+
+        return cls(
+            state_space=state_space,
+            target_dim=target_dim,
+            latent_spatial_size=latent_spatial_size,
+            normalize_target_mode=normalize_target_mode,
+            normalize_target=normalize_target_mode != "none",
+            latent_stats_path=as_optional_path(
+                cfg.get("latent_stats_path", cfg.get("normalization_stat_path", None))
+            ),
+            latent_stats_eps=float(cfg.get("latent_stats_eps", 1e-5)),
+            temporal_align_mode=temporal_align_mode,
+            temporal_groups=temporal_groups,
+            temporal_indices=temporal_indices,
+        )
+
+    @property
+    def temporal_steps(self) -> int:
+        if self.temporal_groups is not None:
+            return len(self.temporal_groups)
+        if self.temporal_indices is not None:
+            return len(self.temporal_indices)
+        return 3
+
+    def token_count_for_shift(self, *, shift_scope: str) -> tuple[int, int]:
+        scope = str(shift_scope).lower()
+        if scope == "future_tokens":
+            time_steps = max(self.temporal_steps - 1, 1)
+        elif scope == "all_tokens":
+            time_steps = max(self.temporal_steps, 1)
+        else:
+            raise ValueError(f"Unsupported RA representation_scheduler.shift_scope: {shift_scope!r}.")
+        height, width = self.latent_spatial_size
+        return self.target_dim * time_steps * height * width, time_steps
+
+    def resolve_shift(
+        self,
+        *,
+        value: Any,
+        shift_base_dim: int,
+        shift_scope: str,
+        name: str,
+    ) -> float:
+        if not (isinstance(value, str) and value.strip().lower() == "auto"):
+            return float(value)
+        if shift_base_dim <= 0:
+            raise ValueError(f"RA representation_scheduler.shift_base_dim must be positive, got {shift_base_dim}.")
+        latent_dim, time_steps = self.token_count_for_shift(shift_scope=shift_scope)
+        shift = math.sqrt(float(latent_dim) / float(shift_base_dim))
+        height, width = self.latent_spatial_size
+        logger.info(
+            "Resolved RA %s=auto to %.4f from latent_dim=%d "
+            "(C=%d T=%d H=%d W=%d base=%d scope=%s).",
+            name,
+            shift,
+            latent_dim,
+            self.target_dim,
+            time_steps,
+            height,
+            width,
+            shift_base_dim,
+            str(shift_scope).lower(),
+        )
+        return float(shift)
 
 
 def _resolve_wan_dit_pretrain_path(model_id: str) -> str | list[str]:
@@ -181,12 +297,6 @@ class RA(nn.Module):
         self.representation_encoder = representation_encoder
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
-        self.capability = {
-            "video_inference": False,
-            "vae_reconstruction": False,
-            "action_inference": True,
-        }
-        self.capabilities = self.capability
         self._capture_representation_viz = False
         self._last_representation_viz = None
 
@@ -220,48 +330,30 @@ class RA(nn.Module):
         self.train_scheduler = self.train_representation_scheduler
         self.infer_scheduler = self.infer_representation_scheduler
 
-        representation = _as_plain_dict(representation)
-        self.representation_state_space = str(representation.get("state_space", "absolute")).lower()
-        if self.representation_state_space not in {"absolute", "delta"}:
-            raise ValueError(
-                "representation.state_space must be one of {'absolute', 'delta'}, "
-                f"got {self.representation_state_space!r}."
-            )
-
-        self.target_dim = int(
-            representation.get(
-                "target_dim",
-                getattr(self.representation_encoder, "output_dim", getattr(self.representation_expert, "in_dim", 2048)),
-            )
+        self.representation_config = RepresentationConfig.from_dict(
+            representation,
+            default_target_dim=int(
+                getattr(
+                    self.representation_encoder,
+                    "output_dim",
+                    getattr(self.representation_expert, "in_dim", 2048),
+                )
+            ),
         )
+        self.representation_state_space = self.representation_config.state_space
+        self.target_dim = self.representation_config.target_dim
         if int(getattr(self.representation_expert, "in_dim", self.target_dim)) != self.target_dim:
             raise ValueError(
                 "Representation expert `in_dim` must match representation target dim: "
                 f"expert={getattr(self.representation_expert, 'in_dim', None)} target={self.target_dim}."
             )
-        self.latent_spatial_size = _as_hw(representation.get("latent_spatial_size", None), default=(12, 10))
-        normalize_target = representation.get("normalize_target", False)
-        if isinstance(normalize_target, str):
-            self.normalize_target_mode = normalize_target.lower()
-        else:
-            self.normalize_target_mode = "per_sample" if bool(normalize_target) else "none"
-        if self.normalize_target_mode in {"false", "off", "no", "0"}:
-            self.normalize_target_mode = "none"
-        if self.normalize_target_mode in {"true", "on", "yes", "1"}:
-            self.normalize_target_mode = "per_sample"
-        if self.normalize_target_mode not in {"none", "per_sample", "dataset"}:
-            raise ValueError(
-                "RA representation.normalize_target must be false/true or one of "
-                "{'none', 'per_sample', 'dataset'}, "
-                f"got {normalize_target!r}."
-            )
-        self.normalize_target = self.normalize_target_mode != "none"
-        self.latent_stats_path = _as_optional_path(
-            representation.get("latent_stats_path", representation.get("normalization_stat_path", None))
-        )
+        self.latent_spatial_size = self.representation_config.latent_spatial_size
+        self.normalize_target_mode = self.representation_config.normalize_target_mode
+        self.normalize_target = self.representation_config.normalize_target
+        self.latent_stats_path = self.representation_config.latent_stats_path
         self.register_buffer("latent_mean", None, persistent=False)
         self.register_buffer("latent_var", None, persistent=False)
-        self.latent_stats_eps = float(representation.get("latent_stats_eps", 1e-5))
+        self.latent_stats_eps = self.representation_config.latent_stats_eps
         if self.normalize_target_mode == "dataset":
             if self.latent_stats_path is None:
                 logger.warning(
@@ -279,25 +371,9 @@ class RA(nn.Module):
                 self.latent_mean = mean.detach().float()
                 self.latent_var = var.detach().float()
                 logger.info("Loaded RA latent normalization stats from %s.", self.latent_stats_path)
-        self.temporal_align_mode = str(representation.get("temporal_align_mode", "strict")).lower()
-        if self.temporal_align_mode not in {"strict", "interpolate"}:
-            raise ValueError(f"Unsupported RA representation.temporal_align_mode: {self.temporal_align_mode}")
-        self.temporal_groups = _parse_temporal_groups(
-            representation.get("temporal_groups", None),
-            "RA representation.temporal_groups",
-            min_steps=2,
-        )
-        temporal_indices = representation.get(
-            "temporal_indices",
-            None if self.temporal_groups is not None else [0, 4, 8],
-        )
-        self.temporal_indices = _parse_temporal_indices(
-            temporal_indices,
-            "RA representation.temporal_indices",
-            min_steps=2,
-        )
-        if self.temporal_groups is not None and self.temporal_indices is not None:
-            raise ValueError("Use only one of RA `representation.temporal_indices` and `representation.temporal_groups`.")
+        self.temporal_align_mode = self.representation_config.temporal_align_mode
+        self.temporal_groups = self.representation_config.temporal_groups
+        self.temporal_indices = self.representation_config.temporal_indices
 
         self.device = torch.device(device)
         self.torch_dtype = torch_dtype
@@ -338,7 +414,7 @@ class RA(nn.Module):
         loss_lambda_action: float = 1.0,
         mot_conditioning: Optional[dict[str, Any]] = None,
     ) -> "RA":
-        representation = _as_plain_dict(representation)
+        representation = as_plain_dict(representation)
         representation_encoder = build_representation_encoder(representation)
         representation_expert = WanVideoDiT(**representation_dit_config).to(device=device, dtype=torch_dtype)
         representation_dit_pretrain_meta = None
@@ -1008,22 +1084,25 @@ class RA(nn.Module):
         clean_future = representation_diffusion_latents[:, :, 1:]
         noisy_future = noisy_repr[:, :, 1:]
         noise_future = noise_repr[:, :, 1:]
-        absolute_future = representation_latents[:, :, 1:]
-        clean_pred_for_viz = self._prediction_to_clean_state(
-            pred_repr=pred_repr,
-            noisy_repr=noisy_future,
-            timestep_repr=timestep_repr,
-        )
+        absolute_future = None
         if self.representation_state_space == "delta":
-            viz_pred = representation_latents[:, :, 0:1] + clean_pred_for_viz
-            viz_target = absolute_future
-        else:
-            viz_pred = clean_pred_for_viz
-            viz_target = clean_future
-        self._maybe_store_representation_visualization(
-            pred_repr=viz_pred,
-            target_repr=viz_target,
-        )
+            absolute_future = representation_latents[:, :, 1:]
+        if self._capture_representation_viz:
+            clean_pred_for_viz = self._prediction_to_clean_state(
+                pred_repr=pred_repr,
+                noisy_repr=noisy_future,
+                timestep_repr=timestep_repr,
+            )
+            if self.representation_state_space == "delta":
+                viz_pred = representation_latents[:, :, 0:1] + clean_pred_for_viz
+                viz_target = absolute_future
+            else:
+                viz_pred = clean_pred_for_viz
+                viz_target = clean_future
+            self._maybe_store_representation_visualization(
+                pred_repr=viz_pred,
+                target_repr=viz_target,
+            )
         loss_repr_per_sample = self._compute_representation_velocity_loss_per_sample(
             pred_repr=pred_repr,
             target_repr=target_repr,
@@ -1179,6 +1258,46 @@ class RA(nn.Module):
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
         return {"action": latents_action[0].detach().to(device="cpu", dtype=torch.float32)}
+
+    @torch.no_grad()
+    def infer(
+        self,
+        prompt: Optional[str],
+        input_image: torch.Tensor,
+        num_frames: Optional[int] = None,
+        action: Optional[torch.Tensor] = None,
+        action_horizon: Optional[int] = None,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        negative_prompt: Optional[str] = None,
+        text_cfg_scale: float = 1.0,
+        action_cfg_scale: float = 1.0,
+        num_inference_steps: int = 20,
+        sigma_shift: Optional[float] = None,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
+        tiled: bool = False,
+    ) -> dict[str, Any]:
+        del action, action_cfg_scale
+        if action_horizon is None:
+            raise ValueError("RA.infer requires `action_horizon` because it only produces action output.")
+        return self.infer_action(
+            prompt=prompt,
+            input_image=input_image,
+            action_horizon=int(action_horizon),
+            proprio=proprio,
+            context=context,
+            context_mask=context_mask,
+            negative_prompt=negative_prompt,
+            text_cfg_scale=text_cfg_scale,
+            num_inference_steps=num_inference_steps,
+            sigma_shift=sigma_shift,
+            seed=seed,
+            rand_device=rand_device,
+            tiled=tiled,
+            num_video_frames=num_frames,
+        )
 
     def save_checkpoint(self, path, optimizer=None, step=None):
         payload = {

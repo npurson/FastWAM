@@ -9,17 +9,54 @@ import torch.nn.functional as F
 from fastwam.models.wan22.wan_video_dit import create_group_causal_attn_mask
 
 
-def _as_plain_dict(value: Any) -> dict[str, Any]:
+def is_none_like(value: Any) -> bool:
     if value is None:
-        return {}
-    if isinstance(value, dict):
-        return dict(value)
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {"", "none", "null"}
+    return False
+
+
+def as_plain_dict(
+    cfg: Any,
+    *,
+    default: Any = None,
+    required: bool = False,
+) -> dict[str, Any]:
+    if is_none_like(cfg):
+        if required:
+            raise ValueError("A non-null dict config is required.")
+        cfg = {} if default is None else default
+    if isinstance(cfg, dict):
+        return dict(cfg)
     try:
         from omegaconf import OmegaConf
 
-        return OmegaConf.to_container(value, resolve=True)
-    except Exception:
-        return dict(value)
+        if OmegaConf.is_config(cfg):
+            cfg = OmegaConf.to_container(cfg, resolve=True)
+        else:
+            cfg = dict(cfg)
+    except Exception as exc:
+        raise ValueError(f"Config must resolve to a dict, got {type(cfg)}") from exc
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Config must resolve to a dict, got {type(cfg)}")
+    return dict(cfg)
+
+
+def as_optional_path(value: Any) -> Optional[str]:
+    if is_none_like(value):
+        return None
+    return str(value)
+
+
+def as_hw(value: Any, default: tuple[int, int]) -> tuple[int, int]:
+    if is_none_like(value):
+        return default
+    if isinstance(value, int):
+        return int(value), int(value)
+    if len(value) != 2:
+        raise ValueError(f"Expected 2D spatial size, got {value}.")
+    return int(value[0]), int(value[1])
 
 
 @dataclass(frozen=True)
@@ -29,8 +66,8 @@ class MotActionToWorldConfig:
 
 
 def parse_mot_action_to_world_config(mot_conditioning: Optional[dict[str, Any]]) -> MotActionToWorldConfig:
-    mot_conditioning = _as_plain_dict(mot_conditioning)
-    action_to_world = _as_plain_dict(mot_conditioning.get("action_to_world", {}))
+    mot_conditioning = as_plain_dict(mot_conditioning)
+    action_to_world = as_plain_dict(mot_conditioning.get("action_to_world", {}))
     mask_mode = str(action_to_world.get("mask_mode", "group_diagonal"))
     if mask_mode not in {"causal", "group_diagonal"}:
         raise ValueError(
@@ -44,7 +81,6 @@ def parse_mot_action_to_world_config(mot_conditioning: Optional[dict[str, Any]])
     )
 
 
-@torch.no_grad()
 def build_world_action_mot_mask(
     *,
     world_expert,

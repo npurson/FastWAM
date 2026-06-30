@@ -239,10 +239,6 @@ def load_wan22_text_components(
     load_text_encoder: bool = True,
 ) -> Wan22LoadedTextComponents:
     if not load_text_encoder:
-        logger.info(
-            "Skipping pretrained text encoder/tokenizer load (`load_text_encoder=False`); "
-            "training must provide cached `context/context_mask`."
-        )
         return Wan22LoadedTextComponents(
             text_encoder=None,
             tokenizer=None,

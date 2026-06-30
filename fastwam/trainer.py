@@ -210,6 +210,14 @@ class Wan22Trainer:
         self.tensorboard_writer.close()
         self.tensorboard_writer = None
 
+    def _log_scalars(self, payload: dict):
+        self._wandb_log(payload)
+        self._tensorboard_log(payload)
+
+    def _close_loggers(self):
+        self._finish_wandb()
+        self._finish_tensorboard()
+
     def _build_loader(self, dataset, worker_init_fn=None):
         self.train_sampler = ResumableEpochSampler(
             dataset=dataset,
@@ -419,6 +427,153 @@ class Wan22Trainer:
             "action_horizon": action_horizon,
         }
 
+    def _eval_video_metrics(self, model, video0: torch.Tensor, pred_video):
+        metrics = {}
+        artifacts = {}
+        gt_video_tensor = ((video0.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5).contiguous()
+        if pred_video is None:
+            return metrics, artifacts
+
+        pred_video_tensor = pil_frames_to_video_tensor(pred_video)
+        assert pred_video_tensor.shape == gt_video_tensor.shape, (
+            "Eval infer prediction/GT shape mismatch: "
+            f"pred={tuple(pred_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
+        )
+        metrics["psnr_rg"] = video_psnr(pred=pred_video_tensor, target=gt_video_tensor)
+        metrics["ssim_rg"] = video_ssim(pred=pred_video_tensor, target=gt_video_tensor)
+
+        encode_video_latents = getattr(model, "_encode_video_latents", None)
+        decode_latents = getattr(model, "_decode_latents", None)
+        has_vae_metrics = callable(encode_video_latents) and callable(decode_latents)
+        video_columns = [pred_video_tensor]
+
+        if has_vae_metrics:
+            gt_video_batch = video0.unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
+            vae_latents = encode_video_latents(gt_video_batch, tiled=False)
+            vae_recon_video = decode_latents(vae_latents, tiled=False)
+            vae_video_tensor = pil_frames_to_video_tensor(vae_recon_video)
+            assert vae_video_tensor.shape == gt_video_tensor.shape, (
+                "Eval VAE reconstruction/GT shape mismatch: "
+                f"vae={tuple(vae_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
+            )
+
+            metrics["psnr_dg"] = video_psnr(pred=vae_video_tensor, target=gt_video_tensor)
+            metrics["ssim_dg"] = video_ssim(pred=vae_video_tensor, target=gt_video_tensor)
+            metrics["psnr_rd"] = video_psnr(pred=pred_video_tensor, target=vae_video_tensor)
+            metrics["ssim_rd"] = video_ssim(pred=pred_video_tensor, target=vae_video_tensor)
+            video_columns.append(vae_video_tensor)
+
+        video_columns.append(gt_video_tensor)
+
+        stitched_video_tensor = torch.cat(
+            video_columns,
+            dim=2,
+        ).contiguous()
+        artifacts["video_tensor"] = stitched_video_tensor
+        if self.accelerator.is_main_process:
+            stitched_frames = []
+            for t in range(stitched_video_tensor.shape[1]):
+                frame = (
+                    stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255.0
+                ).astype(np.uint8)
+                stitched_frames.append(Image.fromarray(frame))
+
+            video_path = os.path.join(
+                self.eval_dir,
+                f"step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}.mp4",
+            )
+            save_mp4(stitched_frames, video_path, fps=8)
+            artifacts["video_path"] = video_path
+        return metrics, artifacts
+
+    def _eval_action_metrics(
+        self,
+        *,
+        sample: dict,
+        action: torch.Tensor | None,
+        pred_action,
+    ) -> dict[str, float]:
+        if action is None or pred_action is None:
+            return {}
+        if sample["proprio"] is None:
+            raise ValueError("Eval sample must contain `proprio` for action denormalization.")
+
+        proprio = sample["proprio"].detach().to(device="cpu", dtype=torch.float32)
+        processor = self.val_dataset.lerobot_dataset.processor
+        action_meta = processor.shape_meta["action"]
+        state_meta = processor.shape_meta["state"]
+
+        def denormalize(action_name: str, raw_action) -> torch.Tensor:
+            if not isinstance(raw_action, torch.Tensor):
+                raise TypeError(f"{action_name} action must be a torch.Tensor, got {type(raw_action)}")
+            if raw_action.ndim == 2:
+                action_btd = raw_action.unsqueeze(0)
+            elif raw_action.ndim == 3 and raw_action.shape[0] == 1:
+                action_btd = raw_action
+            else:
+                raise ValueError(
+                    f"{action_name} action must have shape [T, D] or [1, T, D], got {tuple(raw_action.shape)}"
+                )
+            batch = {
+                "action": action_btd.detach().to(device="cpu", dtype=torch.float32),
+                "state": proprio,
+            }
+            batch = processor.action_state_merger.backward(batch)
+            batch = processor.normalizer.backward(batch)
+            merged_batch = {
+                "action": {meta["key"]: batch["action"][meta["key"]].squeeze(0) for meta in action_meta},
+                "state": {meta["key"]: batch["state"][meta["key"]].squeeze(0) for meta in state_meta},
+            }
+            merged_batch = processor.action_state_merger.forward(merged_batch)
+            denorm_action = merged_batch["action"].unsqueeze(0)
+            if denorm_action.ndim != 3 or denorm_action.shape[0] != 1:
+                raise ValueError(
+                    f"Denormalized {action_name} action must have shape [1, T, D], got {tuple(denorm_action.shape)}"
+                )
+            return denorm_action
+
+        pred_action_denorm = denormalize("pred", pred_action)
+        gt_action_denorm = denormalize("gt", action)
+        if pred_action_denorm.shape != gt_action_denorm.shape:
+            raise ValueError(
+                "Predicted action/GT action shape mismatch after denormalization: "
+                f"pred={tuple(pred_action_denorm.shape)} vs gt={tuple(gt_action_denorm.shape)}"
+            )
+        action_diff = pred_action_denorm - gt_action_denorm
+        return {
+            "action_l1": action_diff.abs().mean().item(),
+            "action_l2": action_diff.pow(2).mean().item(),
+        }
+
+    def _gather_optional_eval_metrics(self, val_loss: float, metrics: dict[str, float]) -> dict[str, float]:
+        metric_names = [
+            "psnr_rg",
+            "ssim_rg",
+            "psnr_rd",
+            "ssim_rd",
+            "psnr_dg",
+            "ssim_dg",
+            "action_l2",
+            "action_l1",
+        ]
+        values = [float(val_loss)]
+        for name in metric_names:
+            present = name in metrics
+            values.extend([1.0 if present else 0.0, float(metrics[name]) if present else 0.0])
+
+        gathered = self.accelerator.gather_for_metrics(
+            torch.tensor(values, device=self.accelerator.device, dtype=torch.float32).unsqueeze(0)
+        )
+        result = {"val_loss": float(gathered[:, 0].mean().item())}
+        col = 1
+        for name in metric_names:
+            mask = gathered[:, col] > 0.5
+            value_col = col + 1
+            if bool(mask.any().item()):
+                result[name] = float(gathered[mask, value_col].mean().item())
+            col += 2
+        return result
+
     @torch.no_grad()
     def evaluate(self):
         if self.val_dataset is None:
@@ -465,153 +620,25 @@ class Wan22Trainer:
         else:
             infer_kwargs["prompt"] = prompt
 
-        pred = model.infer(
-            **infer_kwargs,
-        )
-        
-        pred_video = pred["video"]
+        pred = model.infer(**infer_kwargs)
+
+        pred_video = pred.get("video", None)
         pred_action = pred.get("action", None)
 
-        # 3. inference metrics against GT video
-        pred_video_tensor = pil_frames_to_video_tensor(pred_video)
-        gt_video_tensor = ((video0.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5).contiguous()
-
-        assert pred_video_tensor.shape == gt_video_tensor.shape, (
-            "Eval infer prediction/GT shape mismatch: "
-            f"pred={tuple(pred_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
-        )
-
-        psnr_rollout_vs_gt = video_psnr(pred=pred_video_tensor, target=gt_video_tensor)
-        ssim_rollout_vs_gt = video_ssim(pred=pred_video_tensor, target=gt_video_tensor)
-
-        action_l1 = None
-        action_l2 = None
-        if action is not None and pred_action is not None:
-            if sample["proprio"] is None:
-                raise ValueError("Eval sample must contain `proprio` for action denormalization.")
-            proprio = sample["proprio"].detach().to(device="cpu", dtype=torch.float32)
-            
-            processor = self.val_dataset.lerobot_dataset.processor
-
-            denorm_actions = {}
-            action_meta = processor.shape_meta["action"]
-            state_meta = processor.shape_meta["state"]
-            for action_name, raw_action in (("pred", pred_action), ("gt", action)):
-                if not isinstance(raw_action, torch.Tensor):
-                    raise TypeError(f"{action_name} action must be a torch.Tensor, got {type(raw_action)}")
-                if raw_action.ndim == 2:
-                    action_btd = raw_action.unsqueeze(0)
-                elif raw_action.ndim == 3 and raw_action.shape[0] == 1:
-                    action_btd = raw_action
-                else:
-                    raise ValueError(
-                        f"{action_name} action must have shape [T, D] or [1, T, D], got {tuple(raw_action.shape)}"
-                    )
-                action_btd = action_btd.detach().to(device="cpu", dtype=torch.float32)
-
-                batch = {
-                    "action": action_btd,
-                    "state": proprio,
-                }
-                batch = processor.action_state_merger.backward(batch)
-                batch = processor.normalizer.backward(batch)
-                merged_batch = {
-                    "action": {meta["key"]: batch["action"][meta["key"]].squeeze(0) for meta in action_meta},
-                    "state": {meta["key"]: batch["state"][meta["key"]].squeeze(0) for meta in state_meta},
-                }
-                merged_batch = processor.action_state_merger.forward(merged_batch)
-                denorm_action = merged_batch["action"].unsqueeze(0)
-                if denorm_action.ndim != 3 or denorm_action.shape[0] != 1:
-                    raise ValueError(
-                        f"Denormalized {action_name} action must have shape [1, T, D], got {tuple(denorm_action.shape)}"
-                    )
-                denorm_actions[action_name] = denorm_action
-
-            pred_action_denorm = denorm_actions["pred"]
-            gt_action_denorm = denorm_actions["gt"]
-
-            if pred_action_denorm.shape != gt_action_denorm.shape:
-                raise ValueError(
-                    "Predicted action/GT action shape mismatch after denormalization: "
-                    f"pred={tuple(pred_action_denorm.shape)} vs gt={tuple(gt_action_denorm.shape)}"
-                )
-            action_diff = pred_action_denorm - gt_action_denorm
-            action_l1 = action_diff.abs().mean().item()
-            action_l2 = action_diff.pow(2).mean().item()
-
-        # 4. Optional VAE reconstruction metrics against GT video
-        if pred_video_tensor is not None:
-            gt_video_batch = video0.unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
-            vae_latents = model._encode_video_latents(gt_video_batch, tiled=False)
-            vae_recon_video = model._decode_latents(vae_latents, tiled=False)
-            vae_video_tensor = pil_frames_to_video_tensor(vae_recon_video)
-
-            assert vae_video_tensor.shape == gt_video_tensor.shape, (
-                "Eval VAE reconstruction/GT shape mismatch: "
-                f"vae={tuple(vae_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
+        local_metrics, artifacts = self._eval_video_metrics(model, video0, pred_video)
+        local_metrics.update(
+            self._eval_action_metrics(
+                sample=sample,
+                action=action,
+                pred_action=pred_action,
             )
-
-            psnr_decode_vs_gt = video_psnr(pred=vae_video_tensor, target=gt_video_tensor)
-            ssim_decode_vs_gt = video_ssim(pred=vae_video_tensor, target=gt_video_tensor)
-
-            psnr_rollout_vs_decode = video_psnr(pred=pred_video_tensor, target=vae_video_tensor)
-            ssim_rollout_vs_decode = video_ssim(pred=pred_video_tensor, target=vae_video_tensor)
-
-            stitched_video_tensor = torch.cat(
-                [pred_video_tensor, vae_video_tensor, gt_video_tensor],
-                dim=2,
-            ).contiguous()
-            video_path = None
-            if self.accelerator.is_main_process:
-                stitched_frames = []
-                for t in range(stitched_video_tensor.shape[1]):
-                    frame = (stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
-                    stitched_frames.append(Image.fromarray(frame))
-
-                video_path = os.path.join(
-                    self.eval_dir,
-                    f"step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}.mp4",
-                )
-                save_mp4(stitched_frames, video_path, fps=8)
-
-        local_metrics = torch.tensor(
-            [
-                float(val_loss),
-                float(psnr_rollout_vs_gt),
-                float(ssim_rollout_vs_gt),
-                float(psnr_rollout_vs_decode),
-                float(ssim_rollout_vs_decode),
-                float(psnr_decode_vs_gt),
-                float(ssim_decode_vs_gt),
-                float(action_l2) if action_l2 is not None else -1.0,
-                float(action_l1) if action_l1 is not None else -1.0,
-            ],
-            device=self.accelerator.device,
-            dtype=torch.float32,
-        ).unsqueeze(0)
-        gathered_metrics = self.accelerator.gather_for_metrics(local_metrics)
-        mean_metrics = gathered_metrics[:, :7].mean(dim=0)
-        action_l2_mean = gathered_metrics[:, 7].mean().item() if action_l2 is not None else None
-        action_l1_mean = gathered_metrics[:, 8].mean().item() if action_l1 is not None else None
+        )
+        result = self._gather_optional_eval_metrics(val_loss, local_metrics)
 
         if was_dit_training:
             self._set_dit_only_train_mode()
 
-        result = {
-            "val_loss": float(mean_metrics[0].item()),
-            "psnr_rg": float(mean_metrics[1].item()),
-            "ssim_rg": float(mean_metrics[2].item()),
-            "psnr_rd": float(mean_metrics[3].item()),
-            "ssim_rd": float(mean_metrics[4].item()),
-            "psnr_dg": float(mean_metrics[5].item()),
-            "ssim_dg": float(mean_metrics[6].item()),
-            "video_path": video_path,
-            "video_tensor": stitched_video_tensor,
-        }
-        if action_l2_mean is not None:
-            result["action_l2"] = float(action_l2_mean)
-        if action_l1_mean is not None:
-            result["action_l1"] = float(action_l1_mean)
+        result.update(artifacts)
         return result
 
     def _save_weights_checkpoint(self, step_tag: str):
@@ -773,8 +800,7 @@ class Wan22Trainer:
                         }
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
-                        self._wandb_log(wandb_payload)
-                        self._tensorboard_log(wandb_payload)
+                        self._log_scalars(wandb_payload)
 
                     if (
                         self.eval_every > 0
@@ -812,10 +838,10 @@ class Wan22Trainer:
                             ):
                                 if key in metrics:
                                     eval_payload[f"eval/{key}"] = float(metrics[key])
-                            self._wandb_log(eval_payload)
-                            self._tensorboard_log(eval_payload)
+                            self._log_scalars(eval_payload)
                             if "video_tensor" in metrics:
-                                self._tensorboard_log_video("eval/pred_vae_gt", metrics["video_tensor"], fps=8)
+                                video_tag = "eval/pred_vae_gt" if "psnr_dg" in metrics else "eval/pred_gt"
+                                self._tensorboard_log_video(video_tag, metrics["video_tensor"], fps=8)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:
                         ckpt_info = self.save_checkpoint()
@@ -836,8 +862,7 @@ class Wan22Trainer:
                                 ckpt_info["weights_path"],
                                 ckpt_info["state_path"],
                             )
-                            self._finish_wandb()
-                            self._finish_tensorboard()
+                            self._close_loggers()
                         return
 
         ckpt_info = self.save_checkpoint()
@@ -848,6 +873,5 @@ class Wan22Trainer:
                 ckpt_info["weights_path"],
                 ckpt_info["state_path"],
             )
-            self._finish_wandb()
-            self._finish_tensorboard()
+            self._close_loggers()
         

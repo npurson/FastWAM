@@ -177,9 +177,10 @@ def _write_summary_files(
 
 
 def _write_failed_records(failed_tasks_file: Path, failed_records: list[dict[str, Any]]) -> None:
-    with failed_tasks_file.open("w", encoding="utf-8") as f:
+    with failed_tasks_file.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
         for rec in failed_records:
-            parts = [
+            row = [
                 str(rec["task_name"]),
                 str(rec["phase"]),
                 f"gpu={rec['gpu_id']}",
@@ -187,10 +188,10 @@ def _write_failed_records(failed_tasks_file: Path, failed_records: list[dict[str
                 f"reason={rec['reason']}",
             ]
             if rec.get("log_file"):
-                parts.append(f"log={rec['log_file']}")
+                row.append(f"log={rec['log_file']}")
             if rec.get("result_file"):
-                parts.append(f"result={rec['result_file']}")
-            f.write(",".join(parts) + "\n")
+                row.append(f"result={rec['result_file']}")
+            writer.writerow(row)
 
 
 def _safe_filename(text: str) -> str:
@@ -321,6 +322,67 @@ def _sync_multinode_status(
     return statuses
 
 
+@dataclass(frozen=True)
+class MultiNodeEvalCoordinator:
+    run_output_dir: Path
+    num_nodes: int
+    node_rank: int
+    master_addr: str
+    master_port: int
+    barrier_timeout_s: int
+
+    @property
+    def enabled(self) -> bool:
+        return self.num_nodes > 1
+
+    @property
+    def abort_file(self) -> Path:
+        return self.run_output_dir / "multinode_abort.json"
+
+    def write_abort(self, failure_message: str) -> None:
+        if self.enabled:
+            _write_abort_signal(
+                abort_file=self.abort_file,
+                node_rank=self.node_rank,
+                failure_message=failure_message,
+            )
+
+    def read_abort(self) -> dict[str, Any] | None:
+        return _read_abort_signal(self.abort_file)
+
+    def remote_abort_message(self) -> str | None:
+        if not self.enabled:
+            return None
+        abort_payload = self.read_abort()
+        if abort_payload is None:
+            return None
+        origin_rank = abort_payload.get("node_rank", "unknown")
+        origin_failure = abort_payload.get("failure_message", "")
+        return (
+            f"aborted due to remote node failure: node_rank={origin_rank}, "
+            f"reason={origin_failure}"
+        )
+
+    def sync_statuses(self, *, has_failure: bool, failure_message: str) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return [
+                {
+                    "node_rank": self.node_rank,
+                    "has_failure": has_failure,
+                    "failure_message": failure_message,
+                }
+            ]
+        return _sync_multinode_status(
+            master_addr=self.master_addr,
+            master_port=self.master_port,
+            num_nodes=self.num_nodes,
+            node_rank=self.node_rank,
+            timeout_s=self.barrier_timeout_s,
+            has_failure=has_failure,
+            failure_message=failure_message,
+        )
+
+
 @dataclass
 class RunningState:
     task_name: str
@@ -328,6 +390,182 @@ class RunningState:
     phase: str  # "clean" | "random"
     process: subprocess.Popen[str]
     log_file: Path
+
+
+@dataclass
+class EvalManager:
+    ckpt_path: Path
+    output_dir: Path
+    run_output_dir: Path
+    manager_log: Path
+    tasks: list[str]
+    all_tasks: list[str]
+    extra_overrides: list[str]
+    max_tasks_per_gpu: int
+    multinode: MultiNodeEvalCoordinator
+    failed_tasks_file: Path
+    summary_csv: Path
+    summary_json: Path
+    final_failed_tasks_file: Path
+    final_summary_csv: Path
+    final_summary_json: Path
+    task_rates: dict[str, dict[str, float | None]]
+    failed_records: list[dict[str, Any]]
+    pending_tasks: deque
+    running_states: list[RunningState]
+    has_failure: bool = False
+    failure_message: str = ""
+
+    phase_to_task_config = {
+        "clean": "demo_clean",
+        "random": "demo_randomized",
+    }
+
+    def log(self, msg: str) -> None:
+        line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+        print(line, flush=True)
+        with self.manager_log.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            f.flush()
+
+    def build_cmd(self, *, task_name: str, gpu_id: int, phase: str) -> list[str]:
+        task_config = self.phase_to_task_config[phase]
+        cmd = [
+            sys.executable,
+            "-u",
+            str(SINGLE_ENTRY),
+            f"ckpt={str(self.ckpt_path)}",
+            f"gpu_id={gpu_id}",
+            f"EVALUATION.task_name={task_name}",
+            f"EVALUATION.task_config={task_config}",
+            f"EVALUATION.output_dir={str(self.output_dir)}",
+        ]
+        cmd.extend(self.extra_overrides)
+        return cmd
+
+    def launch_phase(self, task_name: str, gpu_id: int, phase: str) -> RunningState:
+        cmd = self.build_cmd(task_name=task_name, gpu_id=gpu_id, phase=phase)
+        worker_log_file = _make_worker_log_file(
+            run_output_dir=self.run_output_dir,
+            task_name=task_name,
+            phase=phase,
+            gpu_id=gpu_id,
+        )
+        self.log(
+            f"launch task={task_name} phase={phase} gpu={gpu_id} "
+            f"log={worker_log_file} cmd={' '.join(cmd)}"
+        )
+        with worker_log_file.open("w", encoding="utf-8") as worker_log_f:
+            worker_log_f.write(f"[manager] cwd={PROJECT_ROOT}\n")
+            worker_log_f.write(f"[manager] cmd={' '.join(cmd)}\n")
+            worker_log_f.flush()
+            process = subprocess.Popen(
+                cmd,
+                cwd=str(PROJECT_ROOT),
+                stdout=worker_log_f,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        return RunningState(
+            task_name=task_name,
+            gpu_id=gpu_id,
+            phase=phase,
+            process=process,
+            log_file=worker_log_file,
+        )
+
+    def terminate_all_running(self) -> None:
+        for state in list(self.running_states):
+            if state.process.poll() is not None:
+                continue
+            self.log(f"terminating task={state.task_name} phase={state.phase} gpu={state.gpu_id}")
+            state.process.terminate()
+        deadline = time.time() + TERMINATE_TIMEOUT_SEC
+        for state in list(self.running_states):
+            if state.process.poll() is not None:
+                continue
+            remaining = max(0.0, deadline - time.time())
+            try:
+                state.process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                self.log(f"killing task={state.task_name} phase={state.phase} gpu={state.gpu_id}")
+                state.process.kill()
+                state.process.wait()
+
+    def apply_remote_abort_if_any(self) -> bool:
+        if self.has_failure:
+            return False
+        remote_message = self.multinode.remote_abort_message()
+        if remote_message is None:
+            return False
+        self.has_failure = True
+        self.failure_message = remote_message
+        self.log(remote_message)
+        self.terminate_all_running()
+        self.running_states.clear()
+        return True
+
+    def gpu_running_count(self, gpu_id: int) -> int:
+        count = 0
+        for state in self.running_states:
+            if state.gpu_id == gpu_id and state.process.poll() is None:
+                count += 1
+        return count
+
+    def try_launch_pending(self, gpu_id: int) -> None:
+        while len(self.pending_tasks) > 0 and self.gpu_running_count(gpu_id) < self.max_tasks_per_gpu:
+            task_name = self.pending_tasks.popleft()
+            self.running_states.append(self.launch_phase(task_name=task_name, gpu_id=gpu_id, phase="clean"))
+
+    def fail(self, failure_message: str, failed_record: dict[str, Any]) -> None:
+        self.has_failure = True
+        self.failure_message = failure_message
+        self.failed_records.append(failed_record)
+        self.log(failure_message)
+        self.multinode.write_abort(failure_message)
+        self.terminate_all_running()
+        self.running_states.clear()
+
+    def write_outputs(self) -> None:
+        _write_summary_files(
+            tasks=self.tasks,
+            task_rates=self.task_rates,
+            summary_csv=self.summary_csv,
+            summary_json=self.summary_json,
+        )
+        _write_failed_records(self.failed_tasks_file, self.failed_records)
+
+    def write_final_outputs(self) -> None:
+        final_task_rates: dict[str, dict[str, float | None]] = {}
+        final_failed_records: list[dict[str, Any]] = []
+
+        for task in self.all_tasks:
+            final_task_rates[task] = {"clean": None, "random": None}
+            for phase in ("clean", "random"):
+                result_file = self.run_output_dir / task / _phase_result_filename(phase)
+                try:
+                    final_task_rates[task][phase] = _parse_success_rate(result_file)
+                except Exception as exc:
+                    final_failed_records.append(
+                        {
+                            "task_name": task,
+                            "phase": phase,
+                            "gpu_id": -1,
+                            "return_code": -1,
+                            "reason": f"final_result_parse_failed:{repr(exc)}",
+                        }
+                    )
+
+        _write_summary_files(
+            tasks=self.all_tasks,
+            task_rates=final_task_rates,
+            summary_csv=self.final_summary_csv,
+            summary_json=self.final_summary_json,
+        )
+        _write_failed_records(self.final_failed_tasks_file, final_failed_records)
+
+        if final_failed_records:
+            raise RuntimeError(f"final summary has {len(final_failed_records)} missing or invalid results")
 
 
 @hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_robotwin.yaml")
@@ -378,7 +616,14 @@ def main(cfg: DictConfig):
     final_failed_tasks_file = run_output_dir / "failed_tasks.txt"
     final_summary_csv = run_output_dir / "summary.csv"
     final_summary_json = run_output_dir / "summary.json"
-    abort_file = run_output_dir / "multinode_abort.json"
+    multinode = MultiNodeEvalCoordinator(
+        run_output_dir=run_output_dir,
+        num_nodes=num_nodes,
+        node_rank=node_rank,
+        master_addr=master_addr,
+        master_port=master_port,
+        barrier_timeout_s=barrier_timeout_s,
+    )
 
     task_name_cfg = cfg.EVALUATION.task_name
     if task_name_cfg is None or str(task_name_cfg).strip() == "":
@@ -395,158 +640,29 @@ def main(cfg: DictConfig):
     failed_records: list[dict[str, Any]] = []
     pending_tasks = deque(tasks)
     running_states: list[RunningState] = []
+    manager = EvalManager(
+        ckpt_path=ckpt_path,
+        output_dir=output_dir,
+        run_output_dir=run_output_dir,
+        manager_log=manager_log,
+        tasks=tasks,
+        all_tasks=all_tasks,
+        extra_overrides=extra_overrides,
+        max_tasks_per_gpu=max_tasks_per_gpu,
+        multinode=multinode,
+        failed_tasks_file=failed_tasks_file,
+        summary_csv=summary_csv,
+        summary_json=summary_json,
+        final_failed_tasks_file=final_failed_tasks_file,
+        final_summary_csv=final_summary_csv,
+        final_summary_json=final_summary_json,
+        task_rates=task_rates,
+        failed_records=failed_records,
+        pending_tasks=pending_tasks,
+        running_states=running_states,
+    )
 
-    phase_to_task_config = {
-        "clean": "demo_clean",
-        "random": "demo_randomized",
-    }
-
-    def log(msg: str) -> None:
-        line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
-        print(line, flush=True)
-        with manager_log.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
-            f.flush()
-
-    def build_cmd(*, task_name: str, gpu_id: int, phase: str) -> list[str]:
-        task_config = phase_to_task_config[phase]
-        cmd = [
-            sys.executable,
-            "-u",
-            str(SINGLE_ENTRY),
-            f"ckpt={str(ckpt_path)}",
-            f"gpu_id={gpu_id}",
-            f"EVALUATION.task_name={task_name}",
-            f"EVALUATION.task_config={task_config}",
-            f"EVALUATION.output_dir={str(output_dir)}",
-        ]
-        cmd.extend(extra_overrides)
-        return cmd
-
-    def launch_phase(task_name: str, gpu_id: int, phase: str) -> RunningState:
-        cmd = build_cmd(task_name=task_name, gpu_id=gpu_id, phase=phase)
-        worker_log_file = _make_worker_log_file(
-            run_output_dir=run_output_dir,
-            task_name=task_name,
-            phase=phase,
-            gpu_id=gpu_id,
-        )
-        log(
-            f"launch task={task_name} phase={phase} gpu={gpu_id} "
-            f"log={worker_log_file} cmd={' '.join(cmd)}"
-        )
-        with worker_log_file.open("w", encoding="utf-8") as worker_log_f:
-            worker_log_f.write(f"[manager] cwd={PROJECT_ROOT}\n")
-            worker_log_f.write(f"[manager] cmd={' '.join(cmd)}\n")
-            worker_log_f.flush()
-            process = subprocess.Popen(
-                cmd,
-                cwd=str(PROJECT_ROOT),
-                stdout=worker_log_f,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-        return RunningState(
-            task_name=task_name,
-            gpu_id=gpu_id,
-            phase=phase,
-            process=process,
-            log_file=worker_log_file,
-        )
-
-    def terminate_all_running() -> None:
-        for state in list(running_states):
-            if state.process.poll() is not None:
-                continue
-            log(f"terminating task={state.task_name} phase={state.phase} gpu={state.gpu_id}")
-            state.process.terminate()
-        deadline = time.time() + TERMINATE_TIMEOUT_SEC
-        for state in list(running_states):
-            if state.process.poll() is not None:
-                continue
-            remaining = max(0.0, deadline - time.time())
-            try:
-                state.process.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
-                log(f"killing task={state.task_name} phase={state.phase} gpu={state.gpu_id}")
-                state.process.kill()
-                state.process.wait()
-
-    def apply_remote_abort_if_any() -> bool:
-        nonlocal has_failure, failure_message
-        if num_nodes <= 1 or has_failure:
-            return False
-        abort_payload = _read_abort_signal(abort_file)
-        if abort_payload is None:
-            return False
-        origin_rank = abort_payload.get("node_rank", "unknown")
-        origin_failure = abort_payload.get("failure_message", "")
-        failure_message = (
-            f"aborted due to remote node failure: node_rank={origin_rank}, "
-            f"reason={origin_failure}"
-        )
-        has_failure = True
-        log(failure_message)
-        terminate_all_running()
-        running_states.clear()
-        return True
-
-    def gpu_running_count(gpu_id: int) -> int:
-        count = 0
-        for state in running_states:
-            if state.gpu_id != gpu_id:
-                continue
-            if state.process.poll() is None:
-                count += 1
-        return count
-
-    def try_launch_pending(gpu_id: int) -> None:
-        while len(pending_tasks) > 0 and gpu_running_count(gpu_id) < max_tasks_per_gpu:
-            task_name = pending_tasks.popleft()
-            running_states.append(launch_phase(task_name=task_name, gpu_id=gpu_id, phase="clean"))
-
-    def write_outputs() -> None:
-        _write_summary_files(
-            tasks=tasks,
-            task_rates=task_rates,
-            summary_csv=summary_csv,
-            summary_json=summary_json,
-        )
-        _write_failed_records(failed_tasks_file, failed_records)
-
-    def write_final_outputs() -> None:
-        final_task_rates: dict[str, dict[str, float | None]] = {}
-        final_failed_records: list[dict[str, Any]] = []
-
-        for task in all_tasks:
-            final_task_rates[task] = {"clean": None, "random": None}
-            for phase in ("clean", "random"):
-                result_file = run_output_dir / task / _phase_result_filename(phase)
-                try:
-                    final_task_rates[task][phase] = _parse_success_rate(result_file)
-                except Exception as exc:
-                    final_failed_records.append(
-                        {
-                            "task_name": task,
-                            "phase": phase,
-                            "gpu_id": -1,
-                            "return_code": -1,
-                            "reason": f"final_result_parse_failed:{repr(exc)}",
-                        }
-                    )
-
-        _write_summary_files(
-            tasks=all_tasks,
-            task_rates=final_task_rates,
-            summary_csv=final_summary_csv,
-            summary_json=final_summary_json,
-        )
-        _write_failed_records(final_failed_tasks_file, final_failed_records)
-
-        if final_failed_records:
-            raise RuntimeError(f"final summary has {len(final_failed_records)} missing or invalid results")
-
-    log(
+    manager.log(
         f"manager start node_rank={node_rank}/{num_nodes} local_tasks={len(tasks)} "
         f"all_tasks={len(all_tasks)} gpu_ids={gpu_ids} max_tasks_per_gpu={max_tasks_per_gpu} "
         f"output_dir={run_output_dir}"
@@ -554,23 +670,19 @@ def main(cfg: DictConfig):
 
     # Launch initial tasks for each GPU up to capacity.
     for gpu_id in gpu_ids:
-        try_launch_pending(gpu_id)
+        manager.try_launch_pending(gpu_id)
 
-    has_failure = False
-    failure_message = ""
-
-    while len(running_states) > 0:
+    while len(manager.running_states) > 0:
         progressed = False
-        for state in list(running_states):
+        for state in list(manager.running_states):
             gpu_id = state.gpu_id
             return_code = state.process.poll()
             if return_code is None:
                 continue
             progressed = True
-            running_states.remove(state)
+            manager.running_states.remove(state)
 
             if return_code != 0:
-                has_failure = True
                 worker_log = _latest_worker_log(run_output_dir, state.task_name, state.phase)
                 log_path = worker_log or state.log_file
                 worker_log_text = f", log={log_path}"
@@ -578,7 +690,8 @@ def main(cfg: DictConfig):
                     f"worker failed: task={state.task_name}, phase={state.phase}, "
                     f"gpu={gpu_id}, return_code={return_code}{worker_log_text}"
                 )
-                failed_records.append(
+                manager.fail(
+                    failure_message,
                     {
                         "task_name": state.task_name,
                         "phase": state.phase,
@@ -586,24 +699,14 @@ def main(cfg: DictConfig):
                         "return_code": return_code,
                         "reason": "process_failed",
                         "log_file": str(log_path),
-                    }
+                    },
                 )
-                log(failure_message)
-                if num_nodes > 1:
-                    _write_abort_signal(
-                        abort_file=abort_file,
-                        node_rank=node_rank,
-                        failure_message=failure_message,
-                    )
-                terminate_all_running()
-                running_states.clear()
                 break
 
             result_file = run_output_dir / state.task_name / _phase_result_filename(state.phase)
             try:
                 success_rate = _parse_success_rate(result_file)
             except Exception as exc:
-                has_failure = True
                 worker_log = _latest_worker_log(run_output_dir, state.task_name, state.phase)
                 log_path = worker_log or state.log_file
                 worker_log_text = f", log={log_path}"
@@ -611,7 +714,8 @@ def main(cfg: DictConfig):
                     f"result parse failed: task={state.task_name}, phase={state.phase}, "
                     f"gpu={gpu_id}, error={repr(exc)}{worker_log_text}"
                 )
-                failed_records.append(
+                manager.fail(
+                    failure_message,
                     {
                         "task_name": state.task_name,
                         "phase": state.phase,
@@ -620,46 +724,37 @@ def main(cfg: DictConfig):
                         "reason": "result_parse_failed",
                         "log_file": str(log_path),
                         "result_file": str(result_file),
-                    }
+                    },
                 )
-                log(failure_message)
-                if num_nodes > 1:
-                    _write_abort_signal(
-                        abort_file=abort_file,
-                        node_rank=node_rank,
-                        failure_message=failure_message,
-                    )
-                terminate_all_running()
-                running_states.clear()
                 break
 
-            task_rates[state.task_name][state.phase] = success_rate
-            log(
+            manager.task_rates[state.task_name][state.phase] = success_rate
+            manager.log(
                 f"done task={state.task_name} phase={state.phase} gpu={gpu_id} "
                 f"success_rate={success_rate:.4f}"
             )
 
             if state.phase == "clean":
-                running_states.append(launch_phase(
+                manager.running_states.append(manager.launch_phase(
                     task_name=state.task_name,
                     gpu_id=gpu_id,
                     phase="random",
                 ))
                 continue
 
-            try_launch_pending(gpu_id)
+            manager.try_launch_pending(gpu_id)
 
-        if has_failure:
+        if manager.has_failure:
             break
-        if apply_remote_abort_if_any():
+        if manager.apply_remote_abort_if_any():
             break
         if not progressed:
             time.sleep(POLL_INTERVAL_SEC)
 
     # Mark not started tasks when failure happened.
-    if has_failure:
-        for task_name in pending_tasks:
-            failed_records.append(
+    if manager.has_failure:
+        for task_name in manager.pending_tasks:
+            manager.failed_records.append(
                 {
                     "task_name": task_name,
                     "phase": "not_started",
@@ -669,33 +764,28 @@ def main(cfg: DictConfig):
                 }
             )
 
-    write_outputs()
-    log(f"node summary saved: {summary_csv} and {summary_json}")
+    manager.write_outputs()
+    manager.log(f"node summary saved: {summary_csv} and {summary_json}")
 
     statuses = [
         {
             "node_rank": node_rank,
-            "has_failure": has_failure,
-            "failure_message": failure_message,
+            "has_failure": manager.has_failure,
+            "failure_message": manager.failure_message,
         }
     ]
-    if num_nodes > 1:
-        log(
+    if multinode.enabled:
+        manager.log(
             f"waiting for multinode eval barrier addr={master_addr} "
             f"port={master_port} timeout_s={barrier_timeout_s}"
         )
         try:
-            statuses = _sync_multinode_status(
-                master_addr=master_addr,
-                master_port=master_port,
-                num_nodes=num_nodes,
-                node_rank=node_rank,
-                timeout_s=barrier_timeout_s,
-                has_failure=has_failure,
-                failure_message=failure_message,
+            statuses = multinode.sync_statuses(
+                has_failure=manager.has_failure,
+                failure_message=manager.failure_message,
             )
         except Exception as exc:
-            abort_payload = _read_abort_signal(abort_file)
+            abort_payload = multinode.read_abort()
             abort_text = ""
             if abort_payload is not None:
                 abort_text = (
@@ -703,14 +793,14 @@ def main(cfg: DictConfig):
                     f"reason={abort_payload.get('failure_message')}"
                 )
             local_status = (
-                f"local node {node_rank} status: has_failure={has_failure}, "
-                f"failure_message={failure_message or '<none>'}"
+                f"local node {node_rank} status: has_failure={manager.has_failure}, "
+                f"failure_message={manager.failure_message or '<none>'}"
             )
             raise RuntimeError(
                 "multinode eval barrier failed before all nodes reported status; "
                 f"{local_status}{abort_text}. Original error: {repr(exc)}"
             ) from exc
-        log("multinode eval barrier passed")
+        manager.log("multinode eval barrier passed")
 
     failed_statuses = [status for status in statuses if status.get("has_failure")]
     if node_rank == 0:
@@ -722,8 +812,8 @@ def main(cfg: DictConfig):
                         f"reason={status.get('failure_message')}\n"
                     )
         else:
-            write_final_outputs()
-            log(f"final summary saved: {final_summary_csv} and {final_summary_json}")
+            manager.write_final_outputs()
+            manager.log(f"final summary saved: {final_summary_csv} and {final_summary_json}")
 
     if failed_statuses:
         raise RuntimeError(
@@ -733,7 +823,7 @@ def main(cfg: DictConfig):
             )
         )
 
-    log("manager finished successfully")
+    manager.log("manager finished successfully")
 
 
 if __name__ == "__main__":

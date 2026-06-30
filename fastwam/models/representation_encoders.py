@@ -8,28 +8,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-
-def _as_plain_dict(cfg: Any) -> dict[str, Any]:
-    if cfg is None:
-        return {}
-    if isinstance(cfg, dict):
-        return dict(cfg)
-    try:
-        from omegaconf import OmegaConf
-
-        return OmegaConf.to_container(cfg, resolve=True)
-    except Exception:
-        return dict(cfg)
+from .utils import as_hw, as_plain_dict
 
 
-def _as_hw(value: Any, default: tuple[int, int]) -> tuple[int, int]:
-    if value is None:
-        return default
-    if isinstance(value, int):
-        return int(value), int(value)
-    if len(value) != 2:
-        raise ValueError(f"Expected 2D size, got {value}.")
-    return int(value[0]), int(value[1])
+def strip_prefix_tokens(tokens: torch.Tensor, spatial_tokens: int, teacher_name: str) -> torch.Tensor:
+    """Keep the final spatial grid tokens after optional class/register prefixes."""
+    spatial_tokens = int(spatial_tokens)
+    if spatial_tokens <= 0:
+        raise ValueError(f"Invalid spatial token count for {teacher_name}: {spatial_tokens}")
+    if tokens.shape[-2] > spatial_tokens:
+        return tokens[..., -spatial_tokens:, :]
+    return tokens
 
 
 class BaseRepresentationEncoder(nn.Module):
@@ -46,7 +35,7 @@ class BaseRepresentationEncoder(nn.Module):
         num_cameras: int = 1,
     ):
         super().__init__()
-        self.input_size = _as_hw(input_size, input_size)
+        self.input_size = as_hw(input_size, input_size)
         self.output_dim = int(output_dim)
         self.camera_layout = str(camera_layout).lower()
         self.num_cameras = int(num_cameras)
@@ -54,10 +43,12 @@ class BaseRepresentationEncoder(nn.Module):
 
     @property
     def model(self) -> Optional[nn.Module]:
-        return self.__dict__.get("_teacher_model", None)
+        return self.__dict__.get("_teacher_model_unregistered", None)
 
     def _set_teacher_model(self, model: nn.Module) -> nn.Module:
-        object.__setattr__(self, "_teacher_model", model)
+        # Keep the frozen teacher outside nn.Module registration so only the
+        # trainable student/MoT parameters appear in ordinary parameter walks.
+        object.__setattr__(self, "_teacher_model_unregistered", model)
         return model
 
     def to(self, *args, **kwargs):
@@ -175,8 +166,7 @@ class BaseRepresentationEncoder(nn.Module):
                     f"{teacher_name} token batch mismatch: got {tuple(tokens.shape)}, "
                     f"expected first dim {expected_batch}."
                 )
-            if tokens.shape[1] > spatial_tokens:
-                tokens = tokens[:, -spatial_tokens:, :]
+            tokens = strip_prefix_tokens(tokens, spatial_tokens, teacher_name)
             if tokens.shape[1] != spatial_tokens:
                 raise ValueError(
                     f"{teacher_name} spatial token count mismatch: "
@@ -197,8 +187,7 @@ class BaseRepresentationEncoder(nn.Module):
                     f"{teacher_name} token shape mismatch: got {tuple(tokens.shape)}, "
                     f"expected [B,T,N,C] with B={batch_size}, T={num_frames}."
                 )
-            if tokens.shape[2] > spatial_tokens:
-                tokens = tokens[:, :, -spatial_tokens:, :]
+            tokens = strip_prefix_tokens(tokens, spatial_tokens, teacher_name)
             if tokens.shape[2] != spatial_tokens:
                 raise ValueError(
                     f"{teacher_name} spatial token count mismatch: "
@@ -435,8 +424,7 @@ class VGGTRepresentationEncoder(BaseRepresentationEncoder):
 
         feat_h = self.input_size[0] // self.patch_size
         feat_w = self.input_size[1] // self.patch_size
-        if tokens.shape[2] > feat_h * feat_w:
-            tokens = tokens[:, :, -feat_h * feat_w :, :]
+        tokens = strip_prefix_tokens(tokens, feat_h * feat_w, "VGGT-Omega")
         if tokens.shape[2] != feat_h * feat_w:
             raise ValueError(f"VGGT-Omega token count mismatch: got {tokens.shape[2]}, expected {feat_h * feat_w}.")
 
@@ -512,7 +500,7 @@ class DINORepresentationEncoder(BaseRepresentationEncoder):
         self.backend = str(backend).lower()
         self.hub_repo = hub_repo
         self.hub_source = hub_source
-        self.hub_kwargs = _as_plain_dict(hub_kwargs)
+        self.hub_kwargs = as_plain_dict(hub_kwargs)
         self.patch_size = int(patch_size)
 
     def _load(self, device: torch.device):
@@ -531,13 +519,16 @@ class DINORepresentationEncoder(BaseRepresentationEncoder):
             model = AutoModel.from_pretrained(self.model_id, trust_remote_code=True)
         else:
             raise ValueError(f"Unsupported DINO backend: {self.backend}")
-        self._set_teacher_model(self._freeze_loaded_model(model.to(device)))
+        self._set_teacher_model(
+            self._freeze_loaded_model(model.to(**self._model_to_kwargs(device)))
+        )
 
     @torch.no_grad()
     def forward_camera_dense(self, video: torch.Tensor) -> torch.Tensor:
         self._load(video.device)
         images, batch_size, num_frames = self._video_to_images(video)
         images = self._normalize_imagenet(images)
+        images = self._cast_teacher_input(images)
         feat_h = self.input_size[0] // self.patch_size
         feat_w = self.input_size[1] // self.patch_size
         spatial_tokens = feat_h * feat_w
@@ -617,8 +608,7 @@ class DINOMultiLayerSumRepresentationEncoder(DINORepresentationEncoder):
                 raise ValueError(f"Unexpected DINO intermediate output type: {type(output)!r}.")
             if output.ndim != 3:
                 raise ValueError(f"DINO intermediate output must be [B,N,C], got {tuple(output.shape)}.")
-            if output.shape[1] > spatial_tokens:
-                output = output[:, -spatial_tokens:, :]
+            output = strip_prefix_tokens(output, spatial_tokens, "DINO-MLS")
             layer_tokens.append(output)
         tokens = torch.stack(layer_tokens, dim=0).sum(dim=0)
         return self._tokens_to_dense(
@@ -658,7 +648,7 @@ class VJEPARepresentationEncoder(BaseRepresentationEncoder):
         self.hub_repo = hub_repo
         self.hub_model_name = hub_model_name
         self.hub_source = hub_source
-        self.hub_kwargs = _as_plain_dict(hub_kwargs)
+        self.hub_kwargs = as_plain_dict(hub_kwargs)
         self.input_layout = str(input_layout).lower()
         self.patch_size = None if patch_size is None else int(patch_size)
 
@@ -682,7 +672,9 @@ class VJEPARepresentationEncoder(BaseRepresentationEncoder):
                 model = model[0]
         else:
             raise ValueError(f"Unsupported V-JEPA backend: {self.backend}")
-        self._set_teacher_model(self._freeze_loaded_model(model.to(device)))
+        self._set_teacher_model(
+            self._freeze_loaded_model(model.to(**self._model_to_kwargs(device)))
+        )
 
     def _extract_tokens(self, output: Any) -> torch.Tensor:
         if isinstance(output, torch.Tensor):
@@ -719,6 +711,7 @@ class VJEPARepresentationEncoder(BaseRepresentationEncoder):
         mean = x.new_tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
         std = x.new_tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
         x = (x - mean) / std
+        x = self._cast_teacher_input(x)
 
         if self.backend in {"hf", "transformers"}:
             out = self.model(pixel_values_videos=x, skip_predictor=True)
@@ -781,19 +774,19 @@ class VJEPARepresentationEncoder(BaseRepresentationEncoder):
 
 
 def build_representation_encoder(cfg: dict[str, Any]) -> BaseRepresentationEncoder:
-    cfg = _as_plain_dict(cfg)
-    encoder_cfg = _as_plain_dict(cfg.get("encoder", {}))
+    cfg = as_plain_dict(cfg)
+    encoder_cfg = as_plain_dict(cfg.get("encoder", {}))
     name = str(
         encoder_cfg.pop("name", cfg.get("teacher", cfg.get("encoder_type", "vggt")))
     ).lower()
     if "feature_dim" in cfg and "output_dim" not in encoder_cfg:
         encoder_cfg["output_dim"] = int(cfg["feature_dim"])
-    if name in {"vggt", "vggt_omega", "vggt-omega"}:
-        return VGGTRepresentationEncoder(**encoder_cfg)
-    if name == "dino":
-        return DINORepresentationEncoder(**encoder_cfg)
-    if name in {"dino_mls", "dinomls", "dinov3_mls", "dinov3mls"}:
-        return DINOMultiLayerSumRepresentationEncoder(**encoder_cfg)
-    if name == "vjepa":
-        return VJEPARepresentationEncoder(**encoder_cfg)
+    encoders = {
+        "vggt_omega": VGGTRepresentationEncoder,
+        "dino": DINORepresentationEncoder,
+        "dino_mls": DINOMultiLayerSumRepresentationEncoder,
+        "vjepa": VJEPARepresentationEncoder,
+    }
+    if name in encoders:
+        return encoders[name](**encoder_cfg)
     raise ValueError(f"Unsupported representation encoder: {name}")

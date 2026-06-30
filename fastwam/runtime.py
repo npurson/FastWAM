@@ -1,17 +1,16 @@
 import logging
-import math
 import os
 import inspect
 from pathlib import Path
 
 import torch
 from hydra.utils import instantiate
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 import numpy as np
 from einops import repeat
-from omegaconf import OmegaConf
 
+from .models.utils import as_plain_dict
 from .trainer import Wan22Trainer
 from .utils.logging_config import get_logger, setup_logging
 from .utils.video_io import save_mp4
@@ -55,10 +54,7 @@ def create_wan22_model(
 ):
     from .models.wan22.wan22 import Wan22Core
 
-    if isinstance(dit_config, DictConfig):
-        dit_config = OmegaConf.to_container(dit_config, resolve=True)
-    if not isinstance(dit_config, dict):
-        raise ValueError(f"`dit_config` must resolve to a dict, got {type(dit_config)}")
+    dit_config = as_plain_dict(dit_config, required=True)
 
     return Wan22Core.from_wan22_pretrained(
         device=device,
@@ -74,51 +70,6 @@ def create_wan22_model(
     )
 
 
-def _as_resolved_dict(value, name: str, *, default=None, required: bool = False):
-    if isinstance(value, DictConfig):
-        value = OmegaConf.to_container(value, resolve=True)
-    if value is None:
-        if required:
-            raise ValueError(f"`{name}` is required.")
-        value = {} if default is None else default
-    if not isinstance(value, dict):
-        raise ValueError(f"`{name}` must resolve to a dict, got {type(value)}")
-    return value
-
-
-def _enable_action_conditioning_if_requested(
-    dit_config: dict,
-    world_conditioning=None,
-    *,
-    action_dim: int | None = None,
-):
-    world_conditioning = _as_resolved_dict(
-        world_conditioning,
-        "world_conditioning",
-        default={},
-    )
-    action_cfg = world_conditioning.get("action", {})
-    if isinstance(action_cfg, DictConfig):
-        action_cfg = OmegaConf.to_container(action_cfg, resolve=True)
-    if action_cfg is None:
-        action_cfg = {}
-    if not isinstance(action_cfg, dict):
-        raise ValueError(f"`world_conditioning.action` must be a dict, got {type(action_cfg)}")
-    if not bool(action_cfg.get("enabled", False)):
-        return dit_config
-
-    dit_config["action_conditioned"] = True
-    dit_config["action_group_causal_mask_mode"] = str(
-        action_cfg.get(
-            "mask_mode",
-            dit_config.get("action_group_causal_mask_mode", "group_diagonal"),
-        )
-    )
-    if action_dim is not None:
-        dit_config["action_dim"] = int(action_dim)
-    return dit_config
-
-
 def _validate_action_scheduler(action_scheduler: dict, model_name: str):
     required_keys = {"train_shift", "infer_shift", "num_train_timesteps"}
     missing_keys = required_keys - set(action_scheduler.keys())
@@ -127,68 +78,6 @@ def _validate_action_scheduler(action_scheduler: dict, model_name: str):
             f"`action_scheduler` missing required keys for {model_name}: {sorted(missing_keys)}. "
             "Expected keys: train_shift, infer_shift, num_train_timesteps."
         )
-
-
-def _is_auto(value) -> bool:
-    return isinstance(value, str) and value.strip().lower() == "auto"
-
-
-def _resolve_representation_shift(
-    *,
-    value,
-    representation: dict,
-    representation_dit_config: dict,
-    shift_base_dim: int,
-    shift_scope: str,
-    name: str,
-) -> float:
-    if not _is_auto(value):
-        return float(value)
-    encoder_cfg = _as_resolved_dict(representation.get("encoder", {}), "representation.encoder")
-    channels = int(
-        representation.get(
-            "target_dim",
-            encoder_cfg.get("output_dim", representation_dit_config.get("in_dim", 1024)),
-        )
-    )
-    latent_spatial_size = representation.get("latent_spatial_size", [12, 10])
-    if isinstance(latent_spatial_size, int):
-        height = width = int(latent_spatial_size)
-    else:
-        height, width = int(latent_spatial_size[0]), int(latent_spatial_size[1])
-    temporal_groups = representation.get("temporal_groups", None)
-    temporal_indices = representation.get("temporal_indices", None)
-    if temporal_groups not in (None, "", "null"):
-        steps = len(temporal_groups)
-    elif temporal_indices not in (None, "", "null"):
-        steps = len(temporal_indices)
-    else:
-        steps = 3
-    scope = str(shift_scope).lower()
-    if scope == "future_tokens":
-        time_steps = max(int(steps) - 1, 1)
-    elif scope == "all_tokens":
-        time_steps = max(int(steps), 1)
-    else:
-        raise ValueError(f"Unsupported RA representation_scheduler.shift_scope: {shift_scope!r}.")
-    if shift_base_dim <= 0:
-        raise ValueError(f"RA representation_scheduler.shift_base_dim must be positive, got {shift_base_dim}.")
-    latent_dim = channels * time_steps * height * width
-    shift = math.sqrt(float(latent_dim) / float(shift_base_dim))
-    logger.info(
-        "Resolved RA %s=auto to %.4f from latent_dim=%d "
-        "(C=%d T=%d H=%d W=%d base=%d scope=%s).",
-        name,
-        shift,
-        latent_dim,
-        channels,
-        time_steps,
-        height,
-        width,
-        shift_base_dim,
-        scope,
-    )
-    return float(shift)
 
 
 def _fastwam_pretrained_kwargs(
@@ -206,23 +95,17 @@ def _fastwam_pretrained_kwargs(
     action_scheduler,
     loss,
     mot_checkpoint_mixed_attn: bool,
-    world_conditioning=None,
     mot_conditioning=None,
     redirect_common_files: bool,
     model_dtype: torch.dtype,
     device: str,
     model_name: str,
 ):
-    video_dit_config = _as_resolved_dict(video_dit_config, "video_dit_config", required=True)
-    action_dit_config = _as_resolved_dict(action_dit_config, "action_dit_config")
-    video_dit_config = _enable_action_conditioning_if_requested(
-        video_dit_config,
-        world_conditioning,
-        action_dim=action_dit_config.get("action_dim"),
-    )
-    video_scheduler = _as_resolved_dict(video_scheduler, "video_scheduler")
-    action_scheduler = _as_resolved_dict(action_scheduler, "action_scheduler", required=True)
-    loss = _as_resolved_dict(loss, "loss")
+    video_dit_config = as_plain_dict(video_dit_config, required=True)
+    action_dit_config = as_plain_dict(action_dit_config)
+    video_scheduler = as_plain_dict(video_scheduler)
+    action_scheduler = as_plain_dict(action_scheduler, required=True)
+    loss = as_plain_dict(loss)
     _validate_action_scheduler(action_scheduler, model_name)
 
     return {
@@ -247,10 +130,42 @@ def _fastwam_pretrained_kwargs(
         "action_num_train_timesteps": int(action_scheduler["num_train_timesteps"]),
         "loss_lambda_video": float(loss.get("lambda_video", 1.0)),
         "loss_lambda_action": float(loss.get("lambda_action", 1.0)),
-        "mot_conditioning": _as_resolved_dict(
+        "mot_conditioning": as_plain_dict(
             mot_conditioning,
-            "mot_conditioning",
             default={},
+        ),
+    }
+
+
+def _ra_scheduler_kwargs(
+    *,
+    representation_scheduler: dict,
+    representation: dict,
+    representation_dit_config: dict,
+) -> dict:
+    from .models.ra import RepresentationConfig
+
+    representation_config = RepresentationConfig.from_dict(
+        representation,
+        default_target_dim=int(representation_dit_config.get("in_dim", 1024)),
+    )
+    shift_base_dim = int(representation_scheduler.get("shift_base_dim", 4096))
+    shift_scope = str(representation_scheduler.get("shift_scope", "future_tokens"))
+    return {
+        "representation_train_shift": representation_config.resolve_shift(
+            value=representation_scheduler.get("train_shift", 5.0),
+            shift_base_dim=shift_base_dim,
+            shift_scope=shift_scope,
+            name="train_shift",
+        ),
+        "representation_infer_shift": representation_config.resolve_shift(
+            value=representation_scheduler.get("infer_shift", 5.0),
+            shift_base_dim=shift_base_dim,
+            shift_scope=shift_scope,
+            name="infer_shift",
+        ),
+        "representation_num_train_timesteps": int(
+            representation_scheduler.get("num_train_timesteps", 1000)
         ),
     }
 
@@ -269,7 +184,6 @@ def create_fastwam(
     action_scheduler=None,
     loss=None,
     mot_checkpoint_mixed_attn: bool = True,
-    world_conditioning=None,
     mot_conditioning=None,
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
@@ -292,7 +206,6 @@ def create_fastwam(
             action_scheduler=action_scheduler,
             loss=loss,
             mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
-            world_conditioning=world_conditioning,
             mot_conditioning=mot_conditioning,
             redirect_common_files=redirect_common_files,
             model_dtype=model_dtype,
@@ -320,7 +233,6 @@ def create_ra(
     loss=None,
     representation=None,
     mot_checkpoint_mixed_attn: bool = True,
-    world_conditioning=None,
     mot_conditioning=None,
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
@@ -329,40 +241,24 @@ def create_ra(
     from .models.helpers.loader import load_wan22_text_components
     from .models.ra import RA
 
-    representation_dit_config = _as_resolved_dict(
+    representation_dit_config = as_plain_dict(
         representation_dit_config,
-        "representation_dit_config",
         required=True,
     )
-    action_dit_config = _as_resolved_dict(action_dit_config, "action_dit_config")
-    representation_dit_config = _enable_action_conditioning_if_requested(
-        representation_dit_config,
-        world_conditioning,
-        action_dim=action_dit_config.get("action_dim"),
-    )
-    representation_scheduler = _as_resolved_dict(representation_scheduler, "representation_scheduler")
-    action_scheduler = _as_resolved_dict(action_scheduler, "action_scheduler", required=True)
-    loss = _as_resolved_dict(loss, "loss")
-    representation = _as_resolved_dict(representation, "representation")
+    action_dit_config = as_plain_dict(action_dit_config)
+    representation_scheduler = as_plain_dict(representation_scheduler)
+    action_scheduler = as_plain_dict(action_scheduler, required=True)
+    loss = as_plain_dict(loss)
+    representation = as_plain_dict(representation)
+    mot_conditioning = as_plain_dict(mot_conditioning, default={})
     _validate_action_scheduler(action_scheduler, "RA")
-    shift_base_dim = int(representation_scheduler.get("shift_base_dim", 4096))
-    shift_scope = str(representation_scheduler.get("shift_scope", "future_tokens"))
-    representation_train_shift = _resolve_representation_shift(
-        value=representation_scheduler.get("train_shift", 5.0),
+    scheduler_kwargs = _ra_scheduler_kwargs(
+        representation_scheduler=representation_scheduler,
         representation=representation,
         representation_dit_config=representation_dit_config,
-        shift_base_dim=shift_base_dim,
-        shift_scope=shift_scope,
-        name="train_shift",
     )
-    representation_infer_shift = _resolve_representation_shift(
-        value=representation_scheduler.get("infer_shift", 5.0),
-        representation=representation,
-        representation_dit_config=representation_dit_config,
-        shift_base_dim=shift_base_dim,
-        shift_scope=shift_scope,
-        name="infer_shift",
-    )
+    proprio_dim = None if proprio_dim is None else int(proprio_dim)
+    representation_dit_pretrained_model_id = representation_dit_pretrained_model_id or model_id
 
     text_components = load_wan22_text_components(
         device=device,
@@ -381,28 +277,22 @@ def create_ra(
         skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
         representation_dit_pretrained_source=representation_dit_pretrained_source,
         representation_dit_pretrained_path=representation_dit_pretrained_path,
-        representation_dit_pretrained_model_id=representation_dit_pretrained_model_id or model_id,
+        representation_dit_pretrained_model_id=representation_dit_pretrained_model_id,
         mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
         representation=representation,
         text_encoder=text_components.text_encoder,
         tokenizer=text_components.tokenizer,
         text_dim=int(representation_dit_config["text_dim"]),
-        proprio_dim=None if proprio_dim is None else int(proprio_dim),
+        proprio_dim=proprio_dim,
         device=device,
         torch_dtype=model_dtype,
-        representation_train_shift=representation_train_shift,
-        representation_infer_shift=representation_infer_shift,
-        representation_num_train_timesteps=int(representation_scheduler.get("num_train_timesteps", 1000)),
+        **scheduler_kwargs,
         action_train_shift=float(action_scheduler["train_shift"]),
         action_infer_shift=float(action_scheduler["infer_shift"]),
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_representation=float(loss.get("lambda_representation", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
-        mot_conditioning=_as_resolved_dict(
-            mot_conditioning,
-            "mot_conditioning",
-            default={},
-        ),
+        mot_conditioning=mot_conditioning,
     )
     model.model_paths.update(
         {

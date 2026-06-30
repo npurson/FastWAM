@@ -9,11 +9,6 @@ mot_checkpoint_mixed_attn: true
 action_dit_pretrained_path: /horizon-bucket/robot_lab/users/haoyi.jiang/repos/fastwam/checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
 skip_dit_load_from_pretrain: false
 
-world_conditioning:
-  action:
-    enabled: false
-    mask_mode: group_diagonal
-
 representation:
   target_dim: ${model.representation.encoder.output_dim}
   # Indices over RobotWin's already sampled 9-frame video sequence.
@@ -21,21 +16,6 @@ representation:
   temporal_align_mode: strict
   latent_spatial_size: [12, 10]
   normalize_target: false
-
-  ## VGGT-Omega
-  # temporal_indices: [0, 2, 4, 6, 8]
-  # temporal_groups: null
-  # encoder:
-  #   name: vggt_omega
-  #   camera_layout: robotwin
-  #   num_cameras: 3
-  #   model_id: facebook/VGGT-Omega
-  #   model_path: /horizon-bucket/robot_lab/users/zhengyu.zou-labs/ckpt/vggt-omega/vggt_omega_1b_512.pt
-  #   repo_path: fastwam/third_party/vggt-omega
-  #   input_size: [256, 320]
-  #   patch_size: 16
-  #   layer_index: -1
-  #   output_dim: 2048
 
   ## DINOv3
   temporal_indices: [0, 2, 4, 6, 8]
@@ -53,6 +33,21 @@ representation:
     output_dim: 1024
     camera_layout: robotwin
     num_cameras: 3
+
+  ## VGGT-Omega
+  # temporal_indices: [0, 2, 4, 6, 8]
+  # temporal_groups: null
+  # encoder:
+  #   name: vggt_omega
+  #   camera_layout: robotwin
+  #   num_cameras: 3
+  #   model_id: facebook/VGGT-Omega
+  #   model_path: /horizon-bucket/robot_lab/users/zhengyu.zou-labs/ckpt/vggt-omega/vggt_omega_1b_512.pt
+  #   repo_path: fastwam/third_party/vggt-omega
+  #   input_size: [256, 320]
+  #   patch_size: 16
+  #   layer_index: -1
+  #   output_dim: 2048
 
   ## V-JEPA
   # temporal_indices: null
@@ -94,9 +89,9 @@ representation_dit_config:
   require_vae_embedding: false
   fuse_vae_embedding_in_latents: true
   video_attention_mask_mode: "first_frame_causal"
-  action_conditioned: ${model.world_conditioning.action.enabled}
+  action_conditioned: false
   action_dim: ${data.train.processor.action_output_dim}
-  action_group_causal_mask_mode: ${model.world_conditioning.action.mask_mode}
+  action_group_causal_mask_mode: group_diagonal
   use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
 
 action_dit_config:

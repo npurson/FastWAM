@@ -10,7 +10,7 @@ from fastwam.utils.logging_config import get_logger
 from .action_dit import ActionDiT
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
-from .mot_utils import (
+from .utils import (
     build_world_action_mot_mask,
     compute_action_flow_loss,
     parse_mot_action_to_world_config,
@@ -565,8 +565,6 @@ class FastWAM(torch.nn.Module):
         loss_dict = {
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
-            "conditioning/action_enabled": float(bool(getattr(self.video_expert, "action_conditioned", False))),
-            "conditioning/mot_action_to_world_enabled": float(self.mot_action_to_world_enabled),
         }
         return loss_total, loss_dict
 

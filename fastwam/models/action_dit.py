@@ -131,7 +131,7 @@ class ActionDiT(nn.Module):
         from pathlib import Path
         p = Path(action_dit_pretrained_path)
         if not p.is_absolute():
-            p = Path(__file__).resolve().parents[4] / p
+            p = Path(__file__).resolve().parents[2] / p
         action_dit_pretrained_path = str(p)
         if not os.path.isfile(action_dit_pretrained_path):
             raise FileNotFoundError(
@@ -148,7 +148,7 @@ class ActionDiT(nn.Module):
             raise ValueError(
                 f"Invalid action backbone payload type from {action_dit_pretrained_path}: {type(payload)}"
             )
-        
+
         policy = payload.get("policy", {})
         if policy:
             logger.info(f"ActionDiT backbone payload policy: {policy}")

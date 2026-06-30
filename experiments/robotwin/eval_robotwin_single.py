@@ -31,6 +31,7 @@ Examples:
 
 import fcntl
 import os
+import re
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -105,7 +106,12 @@ def _resolve_ckpt_tag(ckpt_path: Path) -> str:
     return ckpt_path.stem
 
 
-def _ensure_policy_symlink(robotwin_root: Path, policy_source_dir: Path) -> Path:
+def _ensure_policy_symlink(
+    robotwin_root: Path,
+    policy_source_dir: Path,
+    *,
+    replace_stale: bool = True,
+) -> Path:
     policy_root = robotwin_root / "policy"
     if not policy_root.is_dir():
         raise FileNotFoundError(f"RoboTwin policy directory not found: {policy_root}")
@@ -118,6 +124,10 @@ def _ensure_policy_symlink(robotwin_root: Path, policy_source_dir: Path) -> Path
             target_resolved = policy_target.resolve()
             if target_resolved == source_resolved:
                 return policy_target
+            if not replace_stale:
+                raise RuntimeError(
+                    f"Policy symlink points to {target_resolved}, expected {source_resolved}"
+                )
             try:
                 policy_target.unlink()
             except FileNotFoundError:
@@ -137,12 +147,19 @@ def _ensure_policy_symlink(robotwin_root: Path, policy_source_dir: Path) -> Path
 
     try:
         policy_target.symlink_to(source_resolved, target_is_directory=True)
-        return policy_target
     except FileExistsError:
         existing = validate_existing()
         if existing is not None:
             return existing
         raise
+    if not policy_target.is_symlink():
+        raise RuntimeError(f"Policy symlink was not created: {policy_target}")
+    target_resolved = policy_target.resolve()
+    if target_resolved != source_resolved:
+        raise RuntimeError(
+            f"Policy symlink points to {target_resolved}, expected {source_resolved}"
+        )
+    return policy_target
 
 
 @contextmanager
@@ -164,25 +181,21 @@ def _result_suffix_from_task_config(task_config: str) -> str:
         return "clean"
     if task_config == "demo_randomized":
         return "random"
-    return task_config.replace("/", "_")
+    return _safe_filename(task_config)
+
+
+def _safe_filename(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(text)).strip("_") or "unknown"
 
 
 def _timestamp_for_filename() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
 
-def _resolve_run_output_dir(output_dir: Path) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir
-
-
 def _make_log_file(run_output_dir: Path, task_name: str, task_config: str) -> Path:
+    task_part = _safe_filename(task_name)
     result_suffix = _result_suffix_from_task_config(task_config)
-    return run_output_dir / f"eval_{task_name}_{result_suffix}_{_timestamp_for_filename()}.log"
-
-
-def _make_robotwin_eval_base(run_output_dir: Path, task_name: str) -> Path:
-    return run_output_dir / task_name
+    return run_output_dir / f"eval_{task_part}_{result_suffix}_{_timestamp_for_filename()}.log"
 
 
 def _write_eval_config(
@@ -191,23 +204,12 @@ def _write_eval_config(
     task_name: str,
     task_config: str,
 ) -> None:
+    task_part = _safe_filename(task_name)
     result_suffix = _result_suffix_from_task_config(task_config)
     OmegaConf.save(
         config=cfg,
-        f=str(run_output_dir / f"eval_config_{task_name}_{result_suffix}.yaml"),
+        f=str(run_output_dir / f"eval_config_{task_part}_{result_suffix}.yaml"),
     )
-
-
-def _validate_policy_symlink(robotwin_root: Path, policy_source_dir: Path) -> None:
-    policy_target = robotwin_root / "policy" / POLICY_NAME
-    if not policy_target.is_symlink():
-        raise RuntimeError(f"Policy symlink was not created: {policy_target}")
-    target_resolved = policy_target.resolve()
-    source_resolved = policy_source_dir.resolve()
-    if target_resolved != source_resolved:
-        raise RuntimeError(
-            f"Policy symlink points to {target_resolved}, expected {source_resolved}"
-        )
 
 
 def _format_override_value(value: Any) -> str:
@@ -247,14 +249,14 @@ def main(cfg: DictConfig):
 
     with _policy_symlink_lock(robotwin_root):
         _ensure_policy_symlink(robotwin_root=robotwin_root, policy_source_dir=policy_source_dir)
-        _validate_policy_symlink(robotwin_root=robotwin_root, policy_source_dir=policy_source_dir)
 
     output_dir = _resolve_path(str(cfg.EVALUATION.output_dir), base=PROJECT_ROOT)
-    run_output_dir = _resolve_run_output_dir(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_output_dir = output_dir
     task_name = str(cfg.EVALUATION.task_name)
     task_config = str(cfg.EVALUATION.task_config)
     log_file = _make_log_file(run_output_dir, task_name, task_config)
-    robotwin_eval_base = _make_robotwin_eval_base(run_output_dir, task_name)
+    robotwin_eval_base = run_output_dir / task_name
 
     sim_cfg_path = (PROJECT_ROOT / "configs" / "sim_robotwin.yaml").resolve()
     sim_task = HydraConfig.get().runtime.choices.get("task")
