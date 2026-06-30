@@ -539,39 +539,40 @@ class Wan22Trainer:
             action_l1 = action_diff.abs().mean().item()
             action_l2 = action_diff.pow(2).mean().item()
 
-        # 4. VAE reconstruction metrics against GT video
-        gt_video_batch = video0.unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
-        vae_latents = model._encode_video_latents(gt_video_batch, tiled=False)
-        vae_recon_video = model._decode_latents(vae_latents, tiled=False)
-        vae_video_tensor = pil_frames_to_video_tensor(vae_recon_video)
+        # 4. Optional VAE reconstruction metrics against GT video
+        if pred_video_tensor is not None:
+            gt_video_batch = video0.unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
+            vae_latents = model._encode_video_latents(gt_video_batch, tiled=False)
+            vae_recon_video = model._decode_latents(vae_latents, tiled=False)
+            vae_video_tensor = pil_frames_to_video_tensor(vae_recon_video)
 
-        assert vae_video_tensor.shape == gt_video_tensor.shape, (
-            "Eval VAE reconstruction/GT shape mismatch: "
-            f"vae={tuple(vae_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
-        )
-
-        psnr_decode_vs_gt = video_psnr(pred=vae_video_tensor, target=gt_video_tensor)
-        ssim_decode_vs_gt = video_ssim(pred=vae_video_tensor, target=gt_video_tensor)
-
-        psnr_rollout_vs_decode = video_psnr(pred=pred_video_tensor, target=vae_video_tensor)
-        ssim_rollout_vs_decode = video_ssim(pred=pred_video_tensor, target=vae_video_tensor)
-
-        stitched_video_tensor = torch.cat(
-            [pred_video_tensor, vae_video_tensor, gt_video_tensor],
-            dim=2,
-        ).contiguous()
-        video_path = None
-        if self.accelerator.is_main_process:
-            stitched_frames = []
-            for t in range(stitched_video_tensor.shape[1]):
-                frame = (stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
-                stitched_frames.append(Image.fromarray(frame))
-
-            video_path = os.path.join(
-                self.eval_dir,
-                f"step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}.mp4",
+            assert vae_video_tensor.shape == gt_video_tensor.shape, (
+                "Eval VAE reconstruction/GT shape mismatch: "
+                f"vae={tuple(vae_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
             )
-            save_mp4(stitched_frames, video_path, fps=8)
+
+            psnr_decode_vs_gt = video_psnr(pred=vae_video_tensor, target=gt_video_tensor)
+            ssim_decode_vs_gt = video_ssim(pred=vae_video_tensor, target=gt_video_tensor)
+
+            psnr_rollout_vs_decode = video_psnr(pred=pred_video_tensor, target=vae_video_tensor)
+            ssim_rollout_vs_decode = video_ssim(pred=pred_video_tensor, target=vae_video_tensor)
+
+            stitched_video_tensor = torch.cat(
+                [pred_video_tensor, vae_video_tensor, gt_video_tensor],
+                dim=2,
+            ).contiguous()
+            video_path = None
+            if self.accelerator.is_main_process:
+                stitched_frames = []
+                for t in range(stitched_video_tensor.shape[1]):
+                    frame = (stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
+                    stitched_frames.append(Image.fromarray(frame))
+
+                video_path = os.path.join(
+                    self.eval_dir,
+                    f"step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}.mp4",
+                )
+                save_mp4(stitched_frames, video_path, fps=8)
 
         local_metrics = torch.tensor(
             [

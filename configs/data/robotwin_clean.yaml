@@ -1,0 +1,149 @@
+train:
+  _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+  dataset_dirs: &robotwin_clean_dataset_dirs
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/adjust_bottle
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/beat_block_hammer
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/blocks_ranking_rgb
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/blocks_ranking_size
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/click_alarmclock
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/click_bell
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/dump_bin_bigbin
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/grab_roller
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/handover_block
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/handover_mic
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/hanging_mug
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/lift_pot
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/move_can_pot
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/move_pillbottle_pad
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/move_playingcard_away
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/move_stapler_pad
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/open_laptop
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/open_microwave
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/pick_diverse_bottles
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/pick_dual_bottles
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/place_a2b_left
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/place_a2b_right
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/place_bread_basket
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/place_bread_skillet
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/place_burger_fries
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/place_can_basket
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/place_cans_plasticbox
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/place_container_plate
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/place_dual_shoes
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/place_empty_cup
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/place_fan
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/place_mouse_pad
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/place_object_basket
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/place_object_scale
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/place_object_stand
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/place_phone_stand
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/place_shoe
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/press_stapler
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/put_bottles_dustbin
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/put_object_cabinet
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/rotate_qrcode
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/scan_object
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/shake_bottle
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/shake_bottle_horizontally
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/stack_blocks_three
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/stack_blocks_two
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/stack_bowls_three
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/stack_bowls_two
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/stamp_seal
+    - /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin/Clean/turn_switch
+  shape_meta: &robotwin_clean_shape_meta
+    images:
+      - key: cam_high
+        raw_shape: [3, 480, 640]
+        shape: [3, 240, 320]
+      - key: cam_left_wrist
+        raw_shape: [3, 480, 640]
+        shape: [3, 240, 320]
+      - key: cam_right_wrist
+        raw_shape: [3, 480, 640]
+        shape: [3, 240, 320]
+    action:
+      - key: default
+        raw_shape: 14
+        shape: 14
+    state:
+      - key: default
+        raw_shape: 14
+        shape: 14
+  num_frames: 33
+  global_sample_stride: 1
+  action_video_freq_ratio: 4
+  video_size: [384, 320]
+  camera_key: null
+  val_set_proportion: 0.01
+  is_training_set: true
+  pretrained_norm_stats: /horizon-bucket/robot_lab/users/haoyi.jiang/repos/fastwam/robotwin2.0-starVLA-clean2rand/dataset_stats.json
+  skip_padding_as_possible: false
+  concat_multi_camera: "robotwin"
+  processor:
+    _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
+    shape_meta: ${data.train.shape_meta}
+    num_obs_steps: ${data.train.num_frames}
+    num_output_cameras: 3
+    action_output_dim: 14
+    proprio_output_dim: 14
+
+    action_state_transforms: null
+    use_stepwise_action_norm: False
+    norm_default_mode: "z-score"
+    norm_exception_mode: null
+
+    action_state_merger:
+      _target_: fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+
+    train_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [240, 320]
+    val_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [240, 320]
+  text_embedding_cache_dir: /horizon-bucket/robot_lab/users/haoyi.jiang/repos/fastwam/robotwin2.0-starVLA-clean2rand/text_embeds
+  context_len: 128
+
+val:
+  _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+  dataset_dirs: *robotwin_clean_dataset_dirs
+  shape_meta: *robotwin_clean_shape_meta
+  num_frames: 33
+  global_sample_stride: 1
+  action_video_freq_ratio: 4
+  video_size: [384, 320]
+  camera_key: null
+  val_set_proportion: 0.01
+  is_training_set: false
+  pretrained_norm_stats: /horizon-bucket/robot_lab/users/haoyi.jiang/repos/fastwam/robotwin2.0-starVLA-clean2rand/dataset_stats.json
+  skip_padding_as_possible: false
+  concat_multi_camera: "robotwin"
+  processor:
+    _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
+    shape_meta: ${data.train.shape_meta}
+    num_obs_steps: ${data.train.num_frames}
+    num_output_cameras: 3
+    action_output_dim: 14
+    proprio_output_dim: 14
+
+    action_state_transforms: null
+    use_stepwise_action_norm: False
+    norm_default_mode: "z-score"
+    norm_exception_mode: null
+
+    action_state_merger:
+      _target_: fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+
+    train_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [240, 320]
+    val_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [240, 320]
+  text_embedding_cache_dir: /horizon-bucket/robot_lab/users/haoyi.jiang/repos/fastwam/robotwin2.0-starVLA-clean2rand/text_embeds
+  context_len: 128

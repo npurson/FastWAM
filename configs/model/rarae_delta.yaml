@@ -1,0 +1,6 @@
+defaults:
+  - rarae
+  - _self_
+
+representation_prediction:
+  state_space: delta

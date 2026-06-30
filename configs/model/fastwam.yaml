@@ -9,6 +9,11 @@ mot_checkpoint_mixed_attn: true
 action_dit_pretrained_path: /horizon-bucket/robot_lab/users/haoyi.jiang/repos/fastwam/checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
 skip_dit_load_from_pretrain: false
 
+world_conditioning:
+  action:
+    enabled: false
+    mask_mode: group_diagonal
+
 video_dit_config:
   has_image_input: false
   patch_size: [1, 2, 2]
@@ -28,9 +33,9 @@ video_dit_config:
   fuse_vae_embedding_in_latents: true
   use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
   video_attention_mask_mode: "first_frame_causal" # default
-  action_conditioned: false
+  action_conditioned: ${model.world_conditioning.action.enabled}
   action_dim: ${data.train.processor.action_output_dim}
-  action_group_causal_mask_mode: "group_diagonal"
+  action_group_causal_mask_mode: ${model.world_conditioning.action.mask_mode}
 
 action_dit_config:
   action_dim: ${data.train.processor.action_output_dim}
