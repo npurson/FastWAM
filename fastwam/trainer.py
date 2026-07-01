@@ -204,6 +204,13 @@ class Wan22Trainer:
         self.tensorboard_writer.add_video(tag, video, self.global_step, fps=fps)
         self.tensorboard_writer.flush()
 
+    def _tensorboard_log_image(self, tag: str, image: torch.Tensor):
+        if self.tensorboard_writer is None:
+            return
+        image = image.detach().float().cpu().clamp(0.0, 1.0)
+        self.tensorboard_writer.add_image(tag, image, self.global_step, dataformats="CHW")
+        self.tensorboard_writer.flush()
+
     def _finish_tensorboard(self):
         if self.tensorboard_writer is None:
             return
@@ -217,6 +224,33 @@ class Wan22Trainer:
     def _close_loggers(self):
         self._finish_wandb()
         self._finish_tensorboard()
+
+    def _should_capture_representation_visualization(self) -> bool:
+        return (
+            self.tensorboard_writer is not None
+            and self.accelerator.is_main_process
+            and self.log_every > 0
+            and self.accelerator.sync_gradients
+            and (self.global_step + 1) % self.log_every == 0
+        )
+
+    @staticmethod
+    def _set_representation_visualization_capture(model, enabled: bool):
+        setter = getattr(model, "set_representation_visualization_capture", None)
+        if callable(setter):
+            setter(enabled)
+
+    def _log_representation_visualization(self, model):
+        pop_visualization = getattr(model, "pop_last_representation_visualization", None)
+        if not callable(pop_visualization):
+            return
+        visualization = pop_visualization()
+        if not isinstance(visualization, dict):
+            return
+        tag = visualization.get("tag")
+        image = visualization.get("image")
+        if isinstance(tag, str) and isinstance(image, torch.Tensor):
+            self._tensorboard_log_image(tag, image)
 
     def _build_loader(self, dataset, worker_init_fn=None):
         self.train_sampler = ResumableEpochSampler(
@@ -746,6 +780,10 @@ class Wan22Trainer:
 
             with self.accelerator.accumulate(self.model):
                 train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
+                self._set_representation_visualization_capture(
+                    unwrapped_model,
+                    self._should_capture_representation_visualization(),
+                )
 
                 with self.accelerator.autocast():
                     loss, loss_dict = train_model.training_loss(sample)
@@ -801,6 +839,7 @@ class Wan22Trainer:
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
                         self._log_scalars(wandb_payload)
+                        self._log_representation_visualization(unwrapped_model)
 
                     if (
                         self.eval_every > 0

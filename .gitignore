@@ -242,3 +242,5 @@ manifest.json
 wandb/
 onelogger.err
 onelogger.log
+
+third_party/
