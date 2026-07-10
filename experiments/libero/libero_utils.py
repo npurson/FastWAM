@@ -1,6 +1,7 @@
 """Utils for evaluating policies in LIBERO simulation environments."""
 
 import math
+import os
 import time
 import pathlib
 
@@ -18,6 +19,14 @@ LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
 
 def get_libero_env(task, resolution, seed, env_num=1):
     """Initializes and returns the LIBERO environment, along with the task description."""
+    visible_devices = [
+        device.strip()
+        for device in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+        if device.strip()
+    ]
+    if len(visible_devices) == 1:
+        os.environ["MUJOCO_EGL_DEVICE_ID"] = "0"
+
     task_description = task.language
     task_bddl_file = (
         pathlib.Path(get_libero_path("bddl_files"))
@@ -25,7 +34,7 @@ def get_libero_env(task, resolution, seed, env_num=1):
         / task.bddl_file
     )
     env_args = {
-        "bddl_file_name": task_bddl_file,
+        "bddl_file_name": str(task_bddl_file),
         "camera_heights": resolution,
         "camera_widths": resolution,
     }
