@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -367,15 +368,16 @@ def _predict_action_chunk(
     input_w: int,
     input_h: int,
     model_device: str,
+    text_context: Optional[torch.Tensor] = None,
+    text_context_mask: Optional[torch.Tensor] = None,
+    timings: Optional[dict[str, float]] = None,
 ) -> tuple[np.ndarray, dict, Optional[list[Image.Image]]]:
     num_inference_steps_cfg = cfg.EVALUATION.get("num_inference_steps", None)
     if num_inference_steps_cfg is None:
         num_inference_steps = int(cfg.get("eval_num_inference_steps", 20))
     else:
         num_inference_steps = int(num_inference_steps_cfg)
-    prompt_template = DEFAULT_PROMPT
-    prompt = prompt_template.format(task=task_description)
-
+    preprocess_start = time.perf_counter()
     image, proprio, imgs = _obs_to_model_input(
         obs,
         cfg=cfg,
@@ -385,9 +387,13 @@ def _predict_action_chunk(
         device=model_device,
         dtype=model.torch_dtype,
     )
+    if timings is not None:
+        timings["observation_preprocess_seconds"] += time.perf_counter() - preprocess_start
 
     infer_kwargs = {
-        "prompt": prompt,
+        "prompt": None if text_context is not None else DEFAULT_PROMPT.format(task=task_description),
+        "context": text_context,
+        "context_mask": text_context_mask,
         "input_image": image,
         "action_horizon": action_horizon,
         "negative_prompt": str(cfg.EVALUATION.get("negative_prompt", "")),
@@ -410,12 +416,15 @@ def _predict_action_chunk(
     elif "num_video_frames" in inspect.signature(model.infer_action).parameters:
         infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
 
-    with torch.no_grad():
+    inference_start = time.perf_counter()
+    with torch.inference_mode():
         if visualize_future_video:
             pred = model.infer_joint(**infer_kwargs)
             predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
         else:
             pred = model.infer_action(**infer_kwargs)
+    if timings is not None:
+        timings["model_inference_seconds"] += time.perf_counter() - inference_start
     action = pred["action"]  # [T, D]
 
     action = _denormalize_action(action, processor)[0]  # [T, D]
@@ -455,6 +464,9 @@ def run_single_episode(
     input_w: int,
     input_h: int,
     model_device: str,
+    text_context: Optional[torch.Tensor] = None,
+    text_context_mask: Optional[torch.Tensor] = None,
+    timings: Optional[dict[str, float]] = None,
 ) -> tuple[bool, list, list[dict[str, Any]], Optional[float]]:
     max_steps = _get_max_steps(cfg.EVALUATION.task_suite_name)
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
@@ -498,6 +510,9 @@ def run_single_episode(
                 input_w=input_w,
                 input_h=input_h,
                 model_device=model_device,
+                text_context=text_context,
+                text_context_mask=text_context_mask,
+                timings=timings,
             )
             if predicted_future_frames is not None:
                 current_replan_idx += 1
@@ -519,7 +534,10 @@ def run_single_episode(
             imgs = get_libero_image(obs)
             replay_images.append(imgs.copy())
 
+        env_step_start = time.perf_counter()
         obs, _, done, _ = env.step(pending_actions.pop(0))
+        if timings is not None:
+            timings["environment_step_seconds"] += time.perf_counter() - env_step_start
         if visualize_future_video and current_predicted_future_clip is not None:
             current_replan_step += 1
             if current_replan_step in capture_steps:
@@ -594,79 +612,107 @@ def run_single_task(
     input_w: int,
     input_h: int,
     model_device: str,
-) -> dict:
+    ) -> dict:
+    timings = {
+        "environment_init_seconds": 0.0,
+        "text_encode_seconds": 0.0,
+        "observation_preprocess_seconds": 0.0,
+        "model_inference_seconds": 0.0,
+        "environment_step_seconds": 0.0,
+        "video_encode_seconds": 0.0,
+    }
+    env_init_start = time.perf_counter()
     env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, cfg.get("seed"))
+    timings["environment_init_seconds"] += time.perf_counter() - env_init_start
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     results = {
         "successes": 0,
         "failure_episodes": [],
         "success_episodes": [],
         "task_description": task_description,
+        "timings": timings,
     }
     if visualize_future_video:
         results["episode_future_video_psnr"] = []
         results["future_video_psnr_mean"] = None
 
-    for trial_idx in range(int(cfg.EVALUATION.num_trials)):
-        success, replay_images, predicted_future_video_clips, episode_mean_psnr = run_single_episode(
-            env=env,
-            initial_state=initial_states[trial_idx],
-            task_description=task_description,
-            model=model,
-            processor=processor,
-            cfg=cfg,
-            episode_idx=trial_idx,
-            action_horizon=action_horizon,
-            input_w=input_w,
-            input_h=input_h,
-            model_device=model_device,
-        )
-        if success:
-            results["successes"] += 1
-            results["success_episodes"].append(trial_idx)
-        else:
-            results["failure_episodes"].append(trial_idx)
-        if visualize_future_video:
-            results["episode_future_video_psnr"].append(episode_mean_psnr)
+    prompt = DEFAULT_PROMPT.format(task=task_description)
+    text_encode_start = time.perf_counter()
+    with torch.inference_mode():
+        text_context, text_context_mask = model.encode_prompt(prompt)
+    timings["text_encode_seconds"] += time.perf_counter() - text_encode_start
 
-        save_rollout_video(
-            video_dir,
-            replay_images,
-            f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
-            success=success,
-            task_description=task_description,
-        )
-        if visualize_future_video:
-            if len(predicted_future_video_clips) == 0:
-                logging.warning(
-                    "No predicted future frames collected for task %s trial %s.",
-                    cfg.EVALUATION.task_id,
-                    trial_idx,
-                )
+    try:
+        for trial_idx in range(int(cfg.EVALUATION.num_trials)):
+            success, replay_images, predicted_future_video_clips, episode_mean_psnr = run_single_episode(
+                env=env,
+                initial_state=initial_states[trial_idx],
+                task_description=task_description,
+                model=model,
+                processor=processor,
+                cfg=cfg,
+                episode_idx=trial_idx,
+                action_horizon=action_horizon,
+                input_w=input_w,
+                input_h=input_h,
+                model_device=model_device,
+                text_context=text_context,
+                text_context_mask=text_context_mask,
+                timings=timings,
+            )
+            if success:
+                results["successes"] += 1
+                results["success_episodes"].append(trial_idx)
             else:
-                all_gt_frames = []
-                all_pred_frames = []
-                for clip in predicted_future_video_clips:
-                    all_gt_frames.extend(clip["gt_frames"])
-                    all_pred_frames.extend(clip["pred_frames"])
-                    save_prediction_video(
-                        predicted_video_dir,
-                        clip["gt_frames"],
-                        clip["pred_frames"],
-                        f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
-                        clip["replan_idx"],
-                        success=success,
-                        task_description=task_description,
-                    )
-                save_prediction_video(
-                    predicted_video_dir,
-                    all_gt_frames,
-                    all_pred_frames,
+                results["failure_episodes"].append(trial_idx)
+            if visualize_future_video:
+                results["episode_future_video_psnr"].append(episode_mean_psnr)
+
+            video_start = time.perf_counter()
+            if bool(cfg.EVALUATION.get("save_rollout_video", True)):
+                save_rollout_video(
+                    video_dir,
+                    replay_images,
                     f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
-                    "all",
                     success=success,
                     task_description=task_description,
                 )
+            if visualize_future_video:
+                if len(predicted_future_video_clips) == 0:
+                    logging.warning(
+                        "No predicted future frames collected for task %s trial %s.",
+                        cfg.EVALUATION.task_id,
+                        trial_idx,
+                    )
+                else:
+                    all_gt_frames = []
+                    all_pred_frames = []
+                    for clip in predicted_future_video_clips:
+                        all_gt_frames.extend(clip["gt_frames"])
+                        all_pred_frames.extend(clip["pred_frames"])
+                        save_prediction_video(
+                            predicted_video_dir,
+                            clip["gt_frames"],
+                            clip["pred_frames"],
+                            f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
+                            clip["replan_idx"],
+                            success=success,
+                            task_description=task_description,
+                        )
+                    save_prediction_video(
+                        predicted_video_dir,
+                        all_gt_frames,
+                        all_pred_frames,
+                        f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
+                        "all",
+                        success=success,
+                        task_description=task_description,
+                    )
+            timings["video_encode_seconds"] += time.perf_counter() - video_start
+    finally:
+        close = getattr(env, "close", None)
+        if callable(close):
+            close()
 
     if visualize_future_video:
         valid_episode_psnr = [x for x in results["episode_future_video_psnr"] if x is not None]
@@ -675,9 +721,20 @@ def run_single_task(
     return results
 
 
-@hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_libero.yaml")
-def eval_single_process(cfg: DictConfig):
-    start_time = time.time()
+@dataclass
+class EvaluationRuntime:
+    model: torch.nn.Module
+    processor: FastWAMProcessor
+    model_device: str
+    action_horizon: int
+    input_h: int
+    input_w: int
+    model_load_seconds: float
+    task_suites: dict[str, Any] = field(default_factory=dict)
+
+
+def build_evaluation_runtime(cfg: DictConfig) -> EvaluationRuntime:
+    load_start = time.perf_counter()
     partial_state = PartialState()
     partial_state.config = cfg
 
@@ -692,7 +749,7 @@ def eval_single_process(cfg: DictConfig):
     if env_num != 1:
         raise ValueError(
             "Only env_num=1 is supported in eval_libero_single.py. "
-            "Use run_libero_manager/run_libero_parallel_test.sh for multi-GPU task parallelism."
+            "Use run_libero_manager.py for persistent multi-GPU task parallelism."
         )
 
     model_device = _resolve_eval_device(cfg)
@@ -720,32 +777,54 @@ def eval_single_process(cfg: DictConfig):
         raise ValueError(f"data.train.video_size must be [H, W], got {video_size}")
     input_h = int(video_size[0])
     input_w = int(video_size[1])
-    concat_multi_camera = cfg.data.train.get("concat_multi_camera", None)
-    shape_meta_images = [meta["shape"] for meta in processor.shape_meta["images"]]
+    return EvaluationRuntime(
+        model=model,
+        processor=processor,
+        model_device=model_device,
+        action_horizon=action_horizon,
+        input_h=input_h,
+        input_w=input_w,
+        model_load_seconds=time.perf_counter() - load_start,
+    )
+
+
+def evaluate_task(
+    cfg: DictConfig,
+    runtime: EvaluationRuntime,
+    *,
+    task_suite_name: str,
+    task_id: int,
+    gpu_id: int,
+) -> tuple[dict[str, Any], Path]:
+    start_time = time.time()
+    if cfg.get("seed") is not None:
+        set_global_seed(int(cfg.seed), get_worker_init_fn=False)
 
     local_log_dir = Path(cfg.EVALUATION.output_dir)
     local_log_dir.mkdir(parents=True, exist_ok=True)
-    video_dir = local_log_dir / cfg.EVALUATION.task_suite_name / "videos"
+    video_dir = local_log_dir / task_suite_name / "videos"
     video_dir.mkdir(parents=True, exist_ok=True)
-    predicted_video_dir = local_log_dir / cfg.EVALUATION.task_suite_name / "predicted_videos"
+    predicted_video_dir = local_log_dir / task_suite_name / "predicted_videos"
     if bool(cfg.EVALUATION.get("visualize_future_video", False)):
         predicted_video_dir.mkdir(parents=True, exist_ok=True)
 
-    benchmark_dict = benchmark.get_benchmark_dict()
-    task_suite = benchmark_dict[cfg.EVALUATION.task_suite_name]()
-    task = task_suite.get_task(cfg.EVALUATION.task_id)
-    initial_states = task_suite.get_task_init_states(cfg.EVALUATION.task_id)
+    if task_suite_name not in runtime.task_suites:
+        benchmark_dict = benchmark.get_benchmark_dict()
+        runtime.task_suites[task_suite_name] = benchmark_dict[task_suite_name]()
+    task_suite = runtime.task_suites[task_suite_name]
+    task = task_suite.get_task(task_id)
+    initial_states = list(task_suite.get_task_init_states(task_id))
 
     while len(initial_states) < int(cfg.EVALUATION.num_trials):
         initial_states.extend(initial_states[: (int(cfg.EVALUATION.num_trials) - len(initial_states))])
 
     results = {
-        "task_suite": cfg.EVALUATION.task_suite_name,
-        "task_id": cfg.EVALUATION.task_id,
+        "task_suite": task_suite_name,
+        "task_id": task_id,
         "task_description": None,
         "successes": 0,
         "total_episodes": int(cfg.EVALUATION.num_trials),
-        "gpu_id": int(cfg.gpu_id),
+        "gpu_id": int(gpu_id),
         "success_episodes": [],
         "failure_episodes": [],
         "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -753,36 +832,57 @@ def eval_single_process(cfg: DictConfig):
     }
 
     logging.info("Running LIBERO evaluation with env_num=1")
+    cfg.EVALUATION.task_suite_name = task_suite_name
+    cfg.EVALUATION.task_id = int(task_id)
+    cfg.gpu_id = int(gpu_id)
     task_results = run_single_task(
         task=task,
         initial_states=initial_states,
-        model=model,
-        processor=processor,
+        model=runtime.model,
+        processor=runtime.processor,
         cfg=cfg,
         video_dir=video_dir,
         predicted_video_dir=predicted_video_dir,
-        action_horizon=action_horizon,
-        input_w=input_w,
-        input_h=input_h,
-        model_device=model_device,
+        action_horizon=runtime.action_horizon,
+        input_w=runtime.input_w,
+        input_h=runtime.input_h,
+        model_device=runtime.model_device,
     )
     results.update(task_results)
 
     results["duration"] = time.time() - start_time
-    output_dir = Path(cfg.EVALUATION.output_dir) / cfg.EVALUATION.task_suite_name
+    results["worker_model_load_seconds"] = runtime.model_load_seconds
+    output_dir = Path(cfg.EVALUATION.output_dir) / task_suite_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_file = output_dir / f"gpu{cfg.gpu_id}_task{cfg.EVALUATION.task_id}_results.json"
+    output_file = output_dir / f"gpu{gpu_id}_task{task_id}_results.json"
+    temp_output_file = output_file.with_suffix(f"{output_file.suffix}.tmp.{os.getpid()}")
 
-    with open(output_file, "w", encoding="utf-8") as f:
+    with open(temp_output_file, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=4, cls=NumpyEncoder)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp_output_file, output_file)
 
     print(
-        f"Task {cfg.EVALUATION.task_id} completed: "
+        f"Task {task_id} completed: "
         f"{results['successes']}/{cfg.EVALUATION.num_trials} successes"
     )
     if results.get("future_video_psnr_mean") is not None:
         print(f"Task {cfg.EVALUATION.task_id} future-video PSNR mean: {results['future_video_psnr_mean']:.4f}")
     print(f"Time taken: {results['duration']:.2f} seconds")
+    return results, output_file
+
+
+@hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_libero.yaml")
+def eval_single_process(cfg: DictConfig):
+    runtime = build_evaluation_runtime(cfg)
+    results, _ = evaluate_task(
+        cfg,
+        runtime,
+        task_suite_name=str(cfg.EVALUATION.task_suite_name),
+        task_id=int(cfg.EVALUATION.task_id),
+        gpu_id=int(cfg.gpu_id),
+    )
     return results
 
 
