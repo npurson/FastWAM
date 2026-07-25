@@ -23,4 +23,5 @@ negative_prompt: ""
 rand_device: cpu
 tiled: false
 timing_enabled: false
-skip_get_obs_within_replan: false
+skip_get_obs_within_replan: true
+full_obs_episode_probability: 0.1

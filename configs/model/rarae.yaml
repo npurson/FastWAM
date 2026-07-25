@@ -6,18 +6,29 @@ load_text_encoder: false
 proprio_dim: ${data.train.processor.proprio_output_dim}
 redirect_common_files: true
 mot_checkpoint_mixed_attn: true
-action_dit_pretrained_path: /horizon-bucket/robot_lab/users/haoyi.jiang/repos/fastwam/checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+action_dit_pretrained_path: null
 skip_dit_load_from_pretrain: false
 
 representation:
-  target_dim: ${model.representation.encoder.output_dim}
-  temporal_indices: [0, 2, 4, 6, 8]
-  temporal_groups: null
+  target_dim: ${model.representation.codec.output_dim}
+  # The dataset already samples the FastWAM 9-frame clip at action steps
+  # [0,4,...,32]. The causal 2x codec keeps frame 0 as a singleton and packs
+  # each following pair, producing five representation steps.
+  temporal_indices: null
+  temporal_groups:
+    - [0]
+    - [1, 2]
+    - [3, 4]
+    - [5, 6]
+    - [7, 8]
   temporal_align_mode: strict
+  # Post-codec spatial size after native-resolution cameras are encoded and
+  # concatenated without mixing camera seams.
   latent_spatial_size: [12, 10]
-  normalize_target: true
-  latent_stats_path: null
+  normalize_target: dataset
+  latent_stats_path: /horizon-bucket/robot_lab/users/haoyi.jiang/repos/fastwam/checkpoints/RAEv2/stats.pt
   latent_stats_eps: 1.0e-05
+  decoder_path: /horizon-bucket/robot_lab/users/haoyi.jiang/repos/fastwam/checkpoints/RAEv2/decoder.pt
   encoder:
     name: dino_mls
     backend: hub
@@ -27,11 +38,31 @@ representation:
     model_id: facebook/dinov3-vitl16-pretrain-lvd1689m
     hub_kwargs: {}
     input_size: [384, 384]
+    # Preserve each camera's native rectangular input. `input_size` remains a
+    # compatibility fallback but is not used when resize_input=false.
+    resize_input: false
     patch_size: 16
     output_dim: 1024
+    norm_affine: false
     layers: [11, 13, 15, 17, 19, 21, 23]
     camera_layout: robotwin
     num_cameras: 3
+  codec:
+    enabled: true
+    type: frozen_random
+    # Used only when type=learned; retained here so cluster overrides can also
+    # switch back to the frozen-random model without changing their CLI shape.
+    checkpoint_path: null
+    output_dim: 512
+    kernel_size: [2, 2, 2]
+    stride: [2, 2, 2]
+    seed: 0
+    norm_eps: 1.0e-06
+    decoder:
+      enabled: true
+      # Online branch only inverts the frozen codec back to normalized DINO
+      # features. The frozen released RAEv2 decoder converts those to RGB.
+      loss_weight: 1.0
 
 representation_dit_config:
   has_image_input: false

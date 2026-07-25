@@ -237,6 +237,7 @@ def create_ra(
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    _model_class=None,
 ):
     from .models.helpers.loader import load_wan22_text_components
     from .models.ra import RA
@@ -270,7 +271,8 @@ def create_ra(
         load_text_encoder=bool(load_text_encoder),
     )
 
-    model = RA.from_config(
+    model_class = RA if _model_class is None else _model_class
+    model = model_class.from_config(
         representation_dit_config=representation_dit_config,
         action_dit_config=action_dit_config,
         action_dit_pretrained_path=action_dit_pretrained_path,
@@ -301,6 +303,12 @@ def create_ra(
         }
     )
     return model
+
+
+def create_ra_joint(**kwargs):
+    from .models.ra_joint import RAJoint
+
+    return create_ra(_model_class=RAJoint, **kwargs)
 
 
 def create_fastwam_joint(

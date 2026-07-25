@@ -90,6 +90,9 @@ class Wan22Trainer:
         proprio_encoder = getattr(self.model, "proprio_encoder", None)
         if proprio_encoder is not None:
             trainable_params.extend(list(proprio_encoder.parameters()))
+        codec_decoder = getattr(self.model, "codec_decoder", None)
+        if codec_decoder is not None and bool(getattr(self.model, "codec_decoder_trainable", True)):
+            trainable_params.extend(list(codec_decoder.parameters()))
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -381,6 +384,10 @@ class Wan22Trainer:
         if proprio_encoder is not None:
             proprio_encoder.train()
             proprio_encoder.requires_grad_(True)
+        codec_decoder = getattr(model, "codec_decoder", None)
+        if codec_decoder is not None and bool(getattr(model, "codec_decoder_trainable", True)):
+            codec_decoder.train()
+            codec_decoder.requires_grad_(True)
 
     @staticmethod
     def _to_batched_eval_sample(sample):
@@ -461,10 +468,22 @@ class Wan22Trainer:
             "action_horizon": action_horizon,
         }
 
-    def _eval_video_metrics(self, model, video0: torch.Tensor, pred_video):
+    def _eval_video_metrics(
+        self,
+        model,
+        video0: torch.Tensor,
+        pred_video,
+        decoded_gt_video=None,
+        metric_gt_video=None,
+    ):
         metrics = {}
         artifacts = {}
-        gt_video_tensor = ((video0.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5).contiguous()
+        if metric_gt_video is None:
+            gt_video_tensor = (
+                (video0.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5
+            ).contiguous()
+        else:
+            gt_video_tensor = pil_frames_to_video_tensor(metric_gt_video)
         if pred_video is None:
             return metrics, artifacts
 
@@ -475,11 +494,22 @@ class Wan22Trainer:
         )
         metrics["psnr_rg"] = video_psnr(pred=pred_video_tensor, target=gt_video_tensor)
         metrics["ssim_rg"] = video_ssim(pred=pred_video_tensor, target=gt_video_tensor)
+        if decoded_gt_video is not None:
+            decoded_gt_tensor = pil_frames_to_video_tensor(decoded_gt_video)
+            assert decoded_gt_tensor.shape == gt_video_tensor.shape, (
+                "Eval codec reconstruction/GT shape mismatch: "
+                f"decoded={tuple(decoded_gt_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
+            )
+            metrics["psnr_dg"] = video_psnr(pred=decoded_gt_tensor, target=gt_video_tensor)
+            metrics["ssim_dg"] = video_ssim(pred=decoded_gt_tensor, target=gt_video_tensor)
 
         encode_video_latents = getattr(model, "_encode_video_latents", None)
         decode_latents = getattr(model, "_decode_latents", None)
         has_vae_metrics = callable(encode_video_latents) and callable(decode_latents)
         video_columns = [pred_video_tensor]
+
+        if decoded_gt_video is not None:
+            video_columns.append(decoded_gt_tensor)
 
         if has_vae_metrics:
             gt_video_batch = video0.unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
@@ -654,12 +684,32 @@ class Wan22Trainer:
         else:
             infer_kwargs["prompt"] = prompt
 
-        pred = model.infer(**infer_kwargs)
+        decoded_gt_video = None
+        metric_gt_video = None
+        if getattr(model, "codec_decoder", None) is not None:
+            joint_kwargs = dict(infer_kwargs)
+            joint_kwargs["num_video_frames"] = joint_kwargs.pop("num_frames")
+            joint_kwargs.pop("action_cfg_scale", None)
+            pred = model.infer_joint(**joint_kwargs)
+            decoded_gt_video = model.reconstruct_representation_video(video0.unsqueeze(0))
+            metric_gt_video = model.prepare_representation_rgb_target(video0.unsqueeze(0))
+        else:
+            pred = model.infer(**infer_kwargs)
 
         pred_video = pred.get("video", None)
         pred_action = pred.get("action", None)
 
-        local_metrics, artifacts = self._eval_video_metrics(model, video0, pred_video)
+        local_metrics, artifacts = self._eval_video_metrics(
+            model,
+            video0,
+            pred_video,
+            decoded_gt_video=decoded_gt_video,
+            metric_gt_video=metric_gt_video,
+        )
+        if metric_gt_video is not None:
+            release_decoder = getattr(model, "release_representation_decoder", None)
+            if callable(release_decoder):
+                release_decoder()
         local_metrics.update(
             self._eval_action_metrics(
                 sample=sample,
@@ -857,6 +907,10 @@ class Wan22Trainer:
                                 description += " infer_psnr=%.4f" % metrics["psnr_rd"]
                             if "ssim_rd" in metrics:
                                 description += " infer_ssim=%.4f" % metrics["ssim_rd"]
+                            if "psnr_rg" in metrics:
+                                description += " rollout_psnr=%.4f" % metrics["psnr_rg"]
+                            if "psnr_dg" in metrics:
+                                description += " decoder_psnr=%.4f" % metrics["psnr_dg"]
                             if "action_l2" in metrics:
                                 description += " action_l2=%.4f" % metrics["action_l2"]
                             if "action_l1" in metrics:
@@ -879,7 +933,10 @@ class Wan22Trainer:
                                     eval_payload[f"eval/{key}"] = float(metrics[key])
                             self._log_scalars(eval_payload)
                             if "video_tensor" in metrics:
-                                video_tag = "eval/pred_vae_gt" if "psnr_dg" in metrics else "eval/pred_gt"
+                                if getattr(unwrapped_model, "codec_decoder", None) is not None:
+                                    video_tag = "eval/rollout_decoder_gt"
+                                else:
+                                    video_tag = "eval/pred_vae_gt" if "psnr_dg" in metrics else "eval/pred_gt"
                                 self._tensorboard_log_video(video_tag, metrics["video_tensor"], fps=8)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:

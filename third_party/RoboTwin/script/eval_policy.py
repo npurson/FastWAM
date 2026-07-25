@@ -381,9 +381,14 @@ def eval_policy(task_name,
             if current_video_path is None or not current_video_path.exists():
                 raise FileNotFoundError(f"Expected eval video file not found: {current_video_path}")
             is_randomized = "randomized" in str(args["task_config"]).lower()
+            observation_refresh_suffix = ""
+            if hasattr(model, "get_observation_refresh_mode"):
+                observation_refresh_mode = str(model.get_observation_refresh_mode())
+                observation_refresh_suffix = f"_obs-{observation_refresh_mode}"
             renamed_video_path = (
                 Path(TASK_ENV.eval_video_path)
-                / f"episode{episode_idx}_randomized-{str(is_randomized).lower()}_success-{str(succ).lower()}.mp4"
+                / f"episode{episode_idx}_randomized-{str(is_randomized).lower()}_"
+                f"success-{str(succ).lower()}{observation_refresh_suffix}.mp4"
             )
             current_video_path.rename(renamed_video_path)
 

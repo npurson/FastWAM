@@ -155,6 +155,11 @@ class WorldActionRobotWinPolicy:
         tiled: bool,
         timing_enabled: bool,
         num_video_frames: int,
+        full_obs_episode_probability: float,
+        visualize_future_video: bool,
+        future_video_max_episodes: int,
+        eval_output_dir: Path,
+        task_config: str,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
@@ -178,18 +183,57 @@ class WorldActionRobotWinPolicy:
         self.tiled = bool(tiled)
         self.timing_enabled = bool(timing_enabled)
         self._num_video_frames = int(num_video_frames)
+        self.full_obs_episode_probability = float(full_obs_episode_probability)
+        if not 0.0 <= self.full_obs_episode_probability <= 1.0:
+            raise ValueError(
+                "full_obs_episode_probability must be within [0, 1], "
+                f"got {self.full_obs_episode_probability}."
+            )
+        self._observation_rng = np.random.default_rng(seed)
+        self._full_obs_episode = False
+        self.visualize_future_video = bool(visualize_future_video)
+        self.future_video_max_episodes = int(future_video_max_episodes)
+        self.future_video_dir = Path(eval_output_dir) / "future_rollouts" / str(task_config)
+        if self.visualize_future_video:
+            if self.future_video_max_episodes <= 0:
+                raise ValueError("future_video_max_episodes must be positive when visualization is enabled.")
+            if (
+                getattr(self.model, "representation_codec", None) is not None
+                and getattr(self.model, "codec_decoder", None) is None
+            ):
+                raise ValueError(
+                    "visualize_future_video=true is unavailable for the frozen random representation codec "
+                    "unless its online RGB decoder is enabled."
+                )
+            if not callable(getattr(self.model, "infer_joint", None)):
+                raise ValueError(
+                    "visualize_future_video=true requires the configured model to implement infer_joint()."
+                )
+            world_expert = getattr(
+                self.model,
+                "video_expert",
+                getattr(self.model, "representation_expert", None),
+            )
+            if bool(getattr(world_expert, "action_conditioned", False)):
+                raise ValueError(
+                    "visualize_future_video=true currently requires an action-independent world branch."
+                )
+            self.future_video_dir.mkdir(parents=True, exist_ok=True)
 
         self.pending_actions: deque[np.ndarray] = deque()
         self.episode_count = 0
         self.step_count = 0
+        self.replan_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
 
         logger.info(
-            "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d",
+            "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | "
+            "replan=%d | full_obs_episode_probability=%.3f",
             checkpoint_path,
             dataset_stats_path,
             self.action_horizon,
             self.replan_steps,
+            self.full_obs_episode_probability,
         )
 
     def _normalize_state(self, state: np.ndarray) -> torch.Tensor:
@@ -233,6 +277,34 @@ class WorldActionRobotWinPolicy:
         image_tensor = image_tensor * (2.0 / 255.0) - 1.0
         return image_tensor
 
+    def _save_future_rollout(self, frames: list[Any]) -> None:
+        if len(frames) == 0:
+            raise ValueError("Cannot save an empty future rollout.")
+        arrays = []
+        for frame in frames:
+            if isinstance(frame, Image.Image):
+                array = np.asarray(frame.convert("RGB"), dtype=np.uint8)
+            else:
+                array = np.asarray(frame, dtype=np.uint8)
+            if array.ndim != 3 or array.shape[2] != 3:
+                raise ValueError(f"Future rollout frame must be RGB, got {array.shape}.")
+            arrays.append(array)
+        target_height = arrays[0].shape[0]
+        arrays = [
+            array
+            if array.shape[0] == target_height
+            else _resize_rgb(array, (int(round(array.shape[1] * target_height / array.shape[0])), target_height))
+            for array in arrays
+        ]
+        strip = np.concatenate(arrays, axis=1)
+        episode_dir = self.future_video_dir / f"episode_{self.episode_count - 1:03d}"
+        episode_dir.mkdir(parents=True, exist_ok=True)
+        output_path = episode_dir / (
+            f"replan_{self.replan_count:03d}_step_{self.step_count:06d}.png"
+        )
+        Image.fromarray(strip, mode="RGB").save(output_path)
+        logger.info("Saved predicted future rollout strip to %s", output_path)
+
     def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
         image_tensor = self._build_robotwin_image_tensor(observation)
         state_vector = np.asarray(observation["joint_action"]["vector"], dtype=np.float32)
@@ -252,26 +324,43 @@ class WorldActionRobotWinPolicy:
             "rand_device": self.rand_device,
             "tiled": self.tiled,
         }
-        if "num_video_frames" in inspect.signature(self.model.infer_action).parameters:
+        capture_future = (
+            self.visualize_future_video
+            and self.episode_count > 0
+            and self.episode_count <= self.future_video_max_episodes
+        )
+        if capture_future or "num_video_frames" in inspect.signature(self.model.infer_action).parameters:
             infer_kwargs["num_video_frames"] = int(self._num_video_frames)
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
-            pred = self.model.infer_action(**infer_kwargs)
+            if capture_future:
+                joint_kwargs = dict(infer_kwargs)
+                if "test_action_with_infer_action" in inspect.signature(self.model.infer_joint).parameters:
+                    joint_kwargs["test_action_with_infer_action"] = False
+                pred = self.model.infer_joint(**joint_kwargs)
+            else:
+                pred = self.model.infer_action(**infer_kwargs)
         if self.timing_enabled:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
 
         action_tensor = pred["action"]  # [T, D]
         action_chunk = self._denormalize_action(action_tensor)[0]  # [T, D]
+        if capture_future:
+            self._save_future_rollout(pred["video"])
         return action_chunk
 
     def _fill_action_queue(self, observation: Dict[str, Any], instruction: str) -> None:
         action_chunk = self._infer_action_chunk(observation=observation, instruction=instruction)
+        self.replan_count += 1
         n_exec = min(self.replan_steps, action_chunk.shape[0])
         for i in range(n_exec):
             self.pending_actions.append(np.asarray(action_chunk[i], dtype=np.float32))
 
     def should_request_observation(self) -> bool:
-        return not self.pending_actions
+        return self._full_obs_episode or not self.pending_actions
+
+    def get_observation_refresh_mode(self) -> str:
+        return "full" if self._full_obs_episode else "replan-only"
 
     def step(self, task_env, observation: Optional[Dict[str, Any]]) -> None:
         if not self.pending_actions:
@@ -308,6 +397,15 @@ class WorldActionRobotWinPolicy:
         self.pending_actions.clear()
         self.episode_count += 1
         self.step_count = 0
+        self.replan_count = 0
+        self._full_obs_episode = bool(
+            self._observation_rng.random() < self.full_obs_episode_probability
+        )
+        logger.info(
+            "Episode %d observation refresh mode: %s",
+            self.episode_count - 1,
+            self.get_observation_refresh_mode(),
+        )
         self.reset_timing_rollout()
 
 
@@ -368,6 +466,29 @@ def get_model(usr_args: Dict[str, Any]):
     timing_enabled = _parse_bool(
         usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", False))
     )
+    full_obs_episode_probability = float(
+        usr_args.get(
+            "full_obs_episode_probability",
+            cfg.EVALUATION.get("full_obs_episode_probability", 0.0),
+        )
+    )
+    visualize_future_video = _parse_bool(
+        usr_args.get(
+            "visualize_future_video",
+            cfg.EVALUATION.get("visualize_future_video", False),
+        )
+    )
+    future_video_max_episodes = int(
+        usr_args.get(
+            "future_video_max_episodes",
+            cfg.EVALUATION.get("future_video_max_episodes", 1),
+        )
+    )
+    eval_output_dir_value = usr_args.get("eval_output_dir")
+    if _is_none_like(eval_output_dir_value):
+        eval_output_dir_value = cfg.EVALUATION.get("output_dir", ".")
+    eval_output_dir = Path(str(eval_output_dir_value)).expanduser().resolve()
+    task_config = str(usr_args.get("task_config", cfg.EVALUATION.get("task_config", "unknown")))
 
     policy = WorldActionRobotWinPolicy(
         model_cfg=cfg.model,
@@ -387,6 +508,11 @@ def get_model(usr_args: Dict[str, Any]):
         tiled=tiled,
         timing_enabled=timing_enabled,
         num_video_frames=(int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1,
+        full_obs_episode_probability=full_obs_episode_probability,
+        visualize_future_video=visualize_future_video,
+        future_video_max_episodes=future_video_max_episodes,
+        eval_output_dir=eval_output_dir,
+        task_config=task_config,
     )
     return policy
 

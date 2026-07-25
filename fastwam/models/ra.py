@@ -7,6 +7,7 @@ from typing import Any, Optional, Sequence, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 
 from fastwam.models.action_dit import ActionDiT
 from fastwam.models.helpers.io import ModelConfig, load_state_dict
@@ -20,6 +21,12 @@ from .utils import (
     parse_mot_action_to_world_config,
 )
 from fastwam.models.representation_encoders import build_representation_encoder
+from fastwam.models.representation_codecs import (
+    CausalCodecFeatureDecoder,
+    FrozenRandomCausalCodec,
+    LearnedCausalCodec,
+    load_codec_weights,
+)
 from fastwam.models.schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 from fastwam.models.wan22.wan_video_dit import WanVideoDiT
 from fastwam.utils.logging_config import get_logger
@@ -330,8 +337,9 @@ class RA(nn.Module):
         self.train_scheduler = self.train_representation_scheduler
         self.infer_scheduler = self.infer_representation_scheduler
 
+        representation_dict = as_plain_dict(representation)
         self.representation_config = RepresentationConfig.from_dict(
-            representation,
+            representation_dict,
             default_target_dim=int(
                 getattr(
                     self.representation_encoder,
@@ -342,6 +350,145 @@ class RA(nn.Module):
         )
         self.representation_state_space = self.representation_config.state_space
         self.target_dim = self.representation_config.target_dim
+        self.encoder_output_dim = int(
+            getattr(self.representation_encoder, "output_dim", self.target_dim)
+        )
+        codec_cfg = as_plain_dict(representation_dict.get("codec", None), default={})
+        self.representation_codec_enabled = bool(codec_cfg.get("enabled", False))
+        self.representation_codec = None
+        self.codec_decoder = None
+        self.codec_decoder_loss_weight = 0.0
+        self.codec_decoder_trainable = False
+        if self.representation_codec_enabled:
+            codec_type = str(codec_cfg.get("type", "frozen_random")).lower()
+            if codec_type not in {"frozen_random", "learned"}:
+                raise ValueError(
+                    "representation.codec.type must be 'frozen_random' or 'learned', "
+                    f"got {codec_type!r}."
+                )
+            codec_output_dim = int(codec_cfg.get("output_dim", self.target_dim))
+            if codec_output_dim != self.target_dim:
+                raise ValueError(
+                    "representation.codec.output_dim must match representation.target_dim: "
+                    f"codec={codec_output_dim}, target={self.target_dim}."
+                )
+            decoder_cfg = as_plain_dict(codec_cfg.get("decoder", None), default={})
+            decoder_enabled = bool(decoder_cfg.get("enabled", False))
+            if codec_type == "frozen_random":
+                self.representation_codec = FrozenRandomCausalCodec(
+                    input_dim=self.encoder_output_dim,
+                    output_dim=codec_output_dim,
+                    kernel_size=codec_cfg.get("kernel_size", (2, 2, 2)),
+                    stride=codec_cfg.get("stride", (2, 2, 2)),
+                    seed=int(codec_cfg.get("seed", 0)),
+                    norm_eps=float(codec_cfg.get("norm_eps", 1e-6)),
+                ).to(dtype=torch_dtype)
+            else:
+                camera_layout = str(
+                    getattr(self.representation_encoder, "camera_layout", "none")
+                ).lower()
+                num_cameras = int(getattr(self.representation_encoder, "num_cameras", 1))
+                if camera_layout != "robotwin" or num_cameras != 3:
+                    raise ValueError(
+                        "The learned front/wrist codec currently requires the three-camera "
+                        f"RobotWin layout, got layout={camera_layout!r}, num_cameras={num_cameras}."
+                    )
+                checkpoint_path = as_optional_path(codec_cfg.get("checkpoint_path"))
+                if checkpoint_path is None:
+                    raise ValueError(
+                        "Learned codec requires representation.codec.checkpoint_path."
+                    )
+
+                def build_codec_pair():
+                    codec = LearnedCausalCodec(
+                        input_dim=self.encoder_output_dim,
+                        output_dim=codec_output_dim,
+                        kernel_size=codec_cfg.get("kernel_size", (2, 2, 2)),
+                        stride=codec_cfg.get("stride", (2, 2, 2)),
+                        norm_eps=float(codec_cfg.get("norm_eps", 1e-6)),
+                    )
+                    decoder = (
+                        CausalCodecFeatureDecoder(
+                            input_dim=codec_output_dim,
+                            output_dim=self.encoder_output_dim,
+                        )
+                        if decoder_enabled
+                        else None
+                    )
+                    return codec, decoder
+
+                front_codec, front_decoder = build_codec_pair()
+                payload = load_codec_weights(
+                    checkpoint_path,
+                    encoder=front_codec,
+                    decoder=front_decoder,
+                    component="front",
+                )
+                wrist_codec, wrist_decoder = build_codec_pair()
+                load_codec_weights(
+                    payload,
+                    encoder=wrist_codec,
+                    decoder=wrist_decoder,
+                    component="wrist",
+                )
+                self.representation_codec = nn.ModuleDict(
+                    {"front": front_codec, "wrist": wrist_codec}
+                ).to(dtype=torch_dtype)
+                if decoder_enabled:
+                    assert front_decoder is not None and wrist_decoder is not None
+                    self.codec_decoder = nn.ModuleDict(
+                        {"front": front_decoder, "wrist": wrist_decoder}
+                    ).to(dtype=torch_dtype)
+                self.representation_codec.eval().requires_grad_(False)
+                if self.codec_decoder is not None:
+                    self.codec_decoder.eval().requires_grad_(False)
+
+            if codec_type == "frozen_random" and decoder_enabled:
+                self.codec_decoder = CausalCodecFeatureDecoder(
+                    input_dim=codec_output_dim,
+                    output_dim=self.encoder_output_dim,
+                ).to(dtype=torch_dtype)
+                self.codec_decoder_loss_weight = float(decoder_cfg.get("loss_weight", 1.0))
+                self.codec_decoder_trainable = bool(decoder_cfg.get("trainable", True))
+                if self.codec_decoder_loss_weight < 0:
+                    raise ValueError("representation.codec.decoder.loss_weight must be non-negative.")
+            elif codec_type == "learned":
+                self.codec_decoder_loss_weight = float(decoder_cfg.get("loss_weight", 0.0))
+                if self.codec_decoder_loss_weight < 0:
+                    raise ValueError("representation.codec.decoder.loss_weight must be non-negative.")
+                if bool(decoder_cfg.get("trainable", False)):
+                    raise ValueError("A pretrained learned codec is frozen during WAM training.")
+            expected_groups = [[0]] + [
+                [idx, idx + 1]
+                for idx in range(1, 2 * self.representation_config.temporal_steps - 1, 2)
+            ]
+            if self.representation_config.temporal_groups != expected_groups:
+                raise ValueError(
+                    "Causal representation codec requires FastWAM-style temporal groups "
+                    f"{expected_groups}, got {self.representation_config.temporal_groups}."
+                )
+            logger.info(
+                "Enabled %s causal representation codec: input_dim=%d output_dim=%d "
+                "output_spatial=%s temporal_groups=%s.",
+                codec_type,
+                self.encoder_output_dim,
+                self.target_dim,
+                self.representation_config.latent_spatial_size,
+                self.representation_config.temporal_groups,
+            )
+            if self.codec_decoder is not None:
+                logger.info(
+                    "Enabled codec feature decoder: %d -> %d channels, loss_weight=%.4f trainable=%s.",
+                    codec_output_dim,
+                    self.encoder_output_dim,
+                    self.codec_decoder_loss_weight,
+                    self.codec_decoder_trainable,
+                )
+        elif self.encoder_output_dim != self.target_dim:
+            raise ValueError(
+                "Representation encoder output dim must match target dim when codec is disabled: "
+                f"encoder={self.encoder_output_dim}, target={self.target_dim}."
+            )
         if int(getattr(self.representation_expert, "in_dim", self.target_dim)) != self.target_dim:
             raise ValueError(
                 "Representation expert `in_dim` must match representation target dim: "
@@ -354,6 +501,8 @@ class RA(nn.Module):
         self.register_buffer("latent_mean", None, persistent=False)
         self.register_buffer("latent_var", None, persistent=False)
         self.latent_stats_eps = self.representation_config.latent_stats_eps
+        self.representation_decoder_path = as_optional_path(representation_dict.get("decoder_path"))
+        self.representation_decoder = None
         if self.normalize_target_mode == "dataset":
             if self.latent_stats_path is None:
                 logger.warning(
@@ -667,18 +816,180 @@ class RA(nn.Module):
             torch.cat([context_mask, proprio_mask], dim=1),
         )
 
+    def _merge_camera_codec_latents(self, camera_latents: list[torch.Tensor]) -> torch.Tensor:
+        if not camera_latents:
+            raise ValueError("Representation codec received no camera latents.")
+        layout = str(getattr(self.representation_encoder, "camera_layout", "none")).lower()
+        num_cameras = int(getattr(self.representation_encoder, "num_cameras", 1))
+        ref_shape = camera_latents[0].shape[:3]
+        for idx, latent in enumerate(camera_latents):
+            if latent.ndim != 5 or latent.shape[:3] != ref_shape:
+                raise ValueError(
+                    "Camera codec latents must share [B,C,T], "
+                    f"camera0={tuple(camera_latents[0].shape)} camera{idx}={tuple(latent.shape)}."
+                )
+
+        if layout in {"none", "single", "null"}:
+            if len(camera_latents) != 1:
+                raise ValueError(f"Single-camera codec layout expected 1 camera, got {len(camera_latents)}.")
+            return camera_latents[0].contiguous()
+
+        if layout == "horizontal":
+            if len(camera_latents) != num_cameras:
+                raise ValueError(
+                    f"Horizontal codec layout expected {num_cameras} cameras, got {len(camera_latents)}."
+                )
+            heights = {int(latent.shape[-2]) for latent in camera_latents}
+            if len(heights) != 1:
+                raise ValueError(f"Horizontal camera latent heights must match, got {sorted(heights)}.")
+            return torch.cat(camera_latents, dim=-1).contiguous()
+
+        if layout == "vertical":
+            if len(camera_latents) != num_cameras:
+                raise ValueError(
+                    f"Vertical codec layout expected {num_cameras} cameras, got {len(camera_latents)}."
+                )
+            widths = {int(latent.shape[-1]) for latent in camera_latents}
+            if len(widths) != 1:
+                raise ValueError(f"Vertical camera latent widths must match, got {sorted(widths)}.")
+            return torch.cat(camera_latents, dim=-2).contiguous()
+
+        if layout == "robotwin":
+            if len(camera_latents) != 3 or num_cameras != 3:
+                raise ValueError(
+                    f"RobotWin codec layout requires exactly 3 cameras, got {len(camera_latents)}/{num_cameras}."
+                )
+            top, left, right = camera_latents
+            if left.shape[-2:] != right.shape[-2:]:
+                raise ValueError(
+                    f"RobotWin wrist latent shapes must match, got {left.shape[-2:]} and {right.shape[-2:]}."
+                )
+            if int(top.shape[-2]) != 2 * int(left.shape[-2]):
+                raise ValueError(
+                    f"RobotWin front latent height must be twice wrist height, got {top.shape[-2:]} and {left.shape[-2:]}."
+                )
+            if int(top.shape[-1]) != int(left.shape[-1]) + int(right.shape[-1]):
+                raise ValueError(
+                    f"RobotWin front width must equal both wrist widths, got {top.shape[-2:]} and {left.shape[-2:]}."
+                )
+            return torch.cat([top, torch.cat([left, right], dim=-1)], dim=-2).contiguous()
+
+        raise ValueError(f"Unsupported representation camera layout for codec: {layout!r}.")
+
+    @staticmethod
+    def _camera_codec_module(module: nn.Module, camera_idx: int) -> nn.Module:
+        if not isinstance(module, nn.ModuleDict):
+            return module
+        key = "front" if int(camera_idx) == 0 else "wrist"
+        if key not in module:
+            raise ValueError(f"Camera-specific codec is missing module {key!r}.")
+        return module[key]
+
+    @torch.no_grad()
+    def _encode_camera_codec_latents(
+        self,
+        camera_videos: list[torch.Tensor],
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        if self.representation_codec is None:
+            raise ValueError("Per-camera codec encoding requires an enabled representation codec.")
+        if not camera_videos:
+            raise ValueError("Per-camera codec encoding received no camera videos.")
+        batch_size = int(camera_videos[0].shape[0])
+        resolution_groups: dict[tuple[int, int], list[int]] = {}
+        for camera_idx, camera_video in enumerate(camera_videos):
+            if camera_video.ndim != 5 or int(camera_video.shape[0]) != batch_size:
+                raise ValueError(f"Invalid camera video {camera_idx}: {tuple(camera_video.shape)}.")
+            resolution = (int(camera_video.shape[-2]), int(camera_video.shape[-1]))
+            resolution_groups.setdefault(resolution, []).append(camera_idx)
+
+        camera_latents: list[Optional[torch.Tensor]] = [None] * len(camera_videos)
+        camera_features: list[Optional[torch.Tensor]] = [None] * len(camera_videos)
+        for camera_indices in resolution_groups.values():
+            packed_video = torch.cat([camera_videos[idx] for idx in camera_indices], dim=0)
+            features = self.representation_encoder.forward_camera_dense(packed_video)
+            if int(features.shape[1]) != self.encoder_output_dim:
+                raise ValueError(
+                    "Representation encoder feature dim mismatch before codec: "
+                    f"got {features.shape[1]}, expected {self.encoder_output_dim}."
+                )
+            if self.normalize_target_mode != "none":
+                features = self._normalize_representation_features(features)
+            codec_modules = {
+                id(self._camera_codec_module(self.representation_codec, idx))
+                for idx in camera_indices
+            }
+            if len(codec_modules) != 1:
+                raise ValueError(
+                    "Cameras packed by resolution must share one codec encoder, "
+                    f"got camera indices {camera_indices}."
+                )
+            codec = self._camera_codec_module(self.representation_codec, camera_indices[0])
+            packed_latents = codec(
+                features.to(device=self.device, dtype=self.torch_dtype)
+            )
+            feature_chunks = features.split(batch_size, dim=0)
+            latent_chunks = packed_latents.split(batch_size, dim=0)
+            for camera_idx, feature, latent in zip(camera_indices, feature_chunks, latent_chunks):
+                camera_features[camera_idx] = feature.to(device=self.device, dtype=self.torch_dtype)
+                camera_latents[camera_idx] = latent
+
+        if any(latent is None for latent in camera_latents) or any(
+            feature is None for feature in camera_features
+        ):
+            raise RuntimeError("Failed to produce a codec latent and feature target for every camera.")
+        return (
+            [latent for latent in camera_latents if latent is not None],
+            [feature for feature in camera_features if feature is not None],
+        )
+
+    @torch.no_grad()
+    def _encode_codec_representation(
+        self,
+        video: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        camera_videos = self.representation_encoder.split_cameras(video)
+        camera_latents, camera_features = self._encode_camera_codec_latents(camera_videos)
+        latents = self._merge_camera_codec_latents(camera_latents)
+        expected_shape = (
+            int(video.shape[0]),
+            self.target_dim,
+            (int(video.shape[2]) + 1) // 2,
+            int(self.latent_spatial_size[0]),
+            int(self.latent_spatial_size[1]),
+        )
+        if tuple(latents.shape) != expected_shape:
+            raise ValueError(
+                "Representation codec output shape mismatch: "
+                f"got {tuple(latents.shape)}, expected {expected_shape}."
+            )
+        return latents.to(device=self.device, dtype=self.torch_dtype), camera_features
+
     @torch.no_grad()
     def _encode_representation_latents(self, video: torch.Tensor) -> torch.Tensor:
         if video.ndim != 5:
             raise ValueError(f"`video` must be [B,C,T,H,W], got {tuple(video.shape)}")
-        features = self.representation_encoder.forward_pixels(video)
+        if self.representation_codec is not None:
+            latents, _ = self._encode_codec_representation(video)
+            return latents
+
+        camera_feature_transform = (
+            self._normalize_representation_features
+            if self.normalize_target_mode == "dataset"
+            else None
+        )
+        features = self.representation_encoder.forward_pixels(
+            video,
+            camera_feature_transform=camera_feature_transform,
+        )
         if features.ndim != 5:
             raise ValueError(
                 "Representation encoder must return dense [B,C,T,H,W] features for RA, "
                 f"got {tuple(features.shape)}."
             )
-        if int(features.shape[1]) != self.target_dim:
-            raise ValueError(f"Representation feature dim mismatch: got {features.shape[1]}, expected {self.target_dim}.")
+        if int(features.shape[1]) != self.encoder_output_dim:
+            raise ValueError(
+                f"Representation feature dim mismatch: got {features.shape[1]}, expected {self.encoder_output_dim}."
+            )
         features = features.float()
         if self.latent_spatial_size is not None:
             features = F.interpolate(
@@ -687,7 +998,8 @@ class RA(nn.Module):
                 mode="trilinear",
                 align_corners=False,
             )
-        features = self._normalize_representation_features(features)
+        if self.normalize_target_mode != "dataset":
+            features = self._normalize_representation_features(features)
         return features.to(device=self.device, dtype=self.torch_dtype)
 
     def _align_representation_temporal_size(self, features: torch.Tensor, target_frames: int) -> torch.Tensor:
@@ -735,7 +1047,9 @@ class RA(nn.Module):
             masks = []
             for group in self.temporal_groups:
                 index_tensor = torch.as_tensor(group, device=image_is_pad.device, dtype=torch.long)
-                masks.append(image_is_pad.index_select(dim=1, index=index_tensor).any(dim=1))
+                # Match FastWAM's latent mask: a compressed temporal group is
+                # padding only when every source frame is padding.
+                masks.append(image_is_pad.index_select(dim=1, index=index_tensor).all(dim=1))
             return torch.stack(masks, dim=1)
         if self.temporal_indices is not None:
             index_tensor = torch.as_tensor(self.temporal_indices, device=image_is_pad.device, dtype=torch.long)
@@ -799,7 +1113,11 @@ class RA(nn.Module):
             raise ValueError(f"`sample['action']` must be [B,T,D], got {tuple(action.shape)}")
 
         input_video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
-        representation_latents = self._encode_representation_latents(input_video)
+        if self.representation_codec is not None:
+            representation_latents, codec_feature_targets = self._encode_codec_representation(input_video)
+        else:
+            representation_latents = self._encode_representation_latents(input_video)
+            codec_feature_targets = []
         representation_latents = self._align_representation_temporal_size(representation_latents, expected_repr_steps)
         num_repr_steps = int(representation_latents.shape[2])
         if num_repr_steps <= 1:
@@ -840,7 +1158,9 @@ class RA(nn.Module):
         return {
             "context": context,
             "context_mask": context_mask,
+            "video": input_video,
             "representation_latents": representation_latents,
+            "codec_feature_targets": codec_feature_targets,
             "first_frame_latents": first_frame_latents,
             "action": action.to(device=self.device, dtype=self.torch_dtype, non_blocking=True),
             "action_is_pad": action_is_pad,
@@ -860,6 +1180,263 @@ class RA(nn.Module):
         latents = self._encode_representation_latents(input_video)
         return self._align_representation_temporal_size(latents, 1)
 
+    def _num_inference_representation_steps(self, num_video_frames: int) -> int:
+        num_video_frames = int(num_video_frames)
+        if num_video_frames <= 1:
+            raise ValueError(
+                f"`num_video_frames` must contain a current and future frame, got {num_video_frames}."
+            )
+        if self.temporal_groups is not None:
+            max_index = max(max(group) for group in self.temporal_groups)
+            if max_index >= num_video_frames:
+                raise ValueError(
+                    "RA `representation.temporal_groups` exceeds inference video length: "
+                    f"groups={self.temporal_groups}, num_video_frames={num_video_frames}."
+                )
+            return len(self.temporal_groups)
+        if self.temporal_indices is not None:
+            max_index = max(self.temporal_indices)
+            if max_index >= num_video_frames:
+                raise ValueError(
+                    "RA `representation.temporal_indices` exceeds inference video length: "
+                    f"indices={self.temporal_indices}, num_video_frames={num_video_frames}."
+                )
+            return len(self.temporal_indices)
+        return num_video_frames
+
+    def _split_representation_camera_latents(self, latents: torch.Tensor) -> list[torch.Tensor]:
+        if latents.ndim != 5:
+            raise ValueError(f"Representation latents must be [B,C,T,H,W], got {tuple(latents.shape)}")
+        layout = str(getattr(self.representation_encoder, "camera_layout", "none")).lower()
+        num_cameras = int(getattr(self.representation_encoder, "num_cameras", 1))
+        height, width = int(latents.shape[-2]), int(latents.shape[-1])
+        if layout in {"none", "single", "null"}:
+            return [latents]
+        if layout == "robotwin":
+            if num_cameras != 3:
+                raise ValueError(f"RobotWin decoder layout requires 3 cameras, got {num_cameras}.")
+            top_height = max(1, int(round(height * 2.0 / 3.0)))
+            if top_height >= height:
+                raise ValueError(f"RobotWin latent is too short to split: H={height}.")
+            left_width = max(1, width // 2)
+            if left_width >= width:
+                raise ValueError(f"RobotWin latent is too narrow to split: W={width}.")
+            return [
+                latents[..., :top_height, :],
+                latents[..., top_height:, :left_width],
+                latents[..., top_height:, left_width:],
+            ]
+        if layout == "horizontal":
+            if width % num_cameras != 0:
+                raise ValueError(
+                    f"Horizontal latent width {width} is not divisible by num_cameras={num_cameras}."
+                )
+            camera_width = width // num_cameras
+            return [latents[..., idx * camera_width : (idx + 1) * camera_width] for idx in range(num_cameras)]
+        if layout == "vertical":
+            if height % num_cameras != 0:
+                raise ValueError(
+                    f"Vertical latent height {height} is not divisible by num_cameras={num_cameras}."
+                )
+            camera_height = height // num_cameras
+            return [latents[..., idx * camera_height : (idx + 1) * camera_height, :] for idx in range(num_cameras)]
+        raise ValueError(f"Unsupported representation camera layout for RAEv2 decoding: {layout!r}.")
+
+    def _decode_codec_feature_latents(self, latents: torch.Tensor) -> list[torch.Tensor]:
+        if self.codec_decoder is None:
+            raise ValueError("Frozen representation codec has no enabled online feature decoder.")
+        camera_latents = self._split_representation_camera_latents(latents)
+        batch_size = int(latents.shape[0])
+        resolution_groups: dict[tuple[int, int], list[int]] = {}
+        for camera_idx, camera_latent in enumerate(camera_latents):
+            resolution = (int(camera_latent.shape[-2]), int(camera_latent.shape[-1]))
+            resolution_groups.setdefault(resolution, []).append(camera_idx)
+
+        decoded_features: list[Optional[torch.Tensor]] = [None] * len(camera_latents)
+        for camera_indices in resolution_groups.values():
+            packed_latents = torch.cat([camera_latents[idx] for idx in camera_indices], dim=0)
+            decoder_modules = {
+                id(self._camera_codec_module(self.codec_decoder, idx))
+                for idx in camera_indices
+            }
+            if len(decoder_modules) != 1:
+                raise ValueError(
+                    "Cameras packed by resolution must share one codec decoder, "
+                    f"got camera indices {camera_indices}."
+                )
+            decoder = self._camera_codec_module(self.codec_decoder, camera_indices[0])
+            packed_features = decoder(packed_latents)
+            chunks = packed_features.split(batch_size, dim=0)
+            for camera_idx, decoded in zip(camera_indices, chunks):
+                decoded_features[camera_idx] = decoded
+        if any(features is None for features in decoded_features):
+            raise RuntimeError("Failed to decode every camera codec latent to DINO features.")
+        return [features for features in decoded_features if features is not None]
+
+    def _codec_decoder_training_loss(
+        self,
+        *,
+        representation_latents: torch.Tensor,
+        feature_targets: list[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.codec_decoder is None or self.codec_decoder_loss_weight == 0.0:
+            return representation_latents.new_zeros(())
+        decoded_features = self._decode_codec_feature_latents(representation_latents.detach())
+        if len(decoded_features) != len(feature_targets):
+            raise ValueError(
+                "Codec feature decoder camera count mismatch: "
+                f"decoded={len(decoded_features)} target={len(feature_targets)}."
+            )
+        losses = []
+        for camera_idx, (decoded, target) in enumerate(zip(decoded_features, feature_targets)):
+            if decoded.shape != target.shape:
+                raise ValueError(
+                    f"Codec feature decoder camera {camera_idx} shape mismatch: "
+                    f"decoded={tuple(decoded.shape)} target={tuple(target.shape)}."
+                )
+            losses.append(F.mse_loss(decoded.float(), target.detach().float()))
+        return torch.stack(losses).mean()
+
+    @torch.no_grad()
+    def reconstruct_representation_video(self, video: torch.Tensor) -> list[Image.Image]:
+        if video.ndim == 4:
+            video = video.unsqueeze(0)
+        if video.ndim != 5 or int(video.shape[0]) != 1:
+            raise ValueError(f"Representation reconstruction expects [1,3,T,H,W], got {tuple(video.shape)}.")
+        selected_video, _ = self._select_training_video(video)
+        selected_video = selected_video.to(device=self.device, dtype=self.torch_dtype)
+        latents = self._encode_representation_latents(selected_video)
+        return self._decode_representation_latents(latents)
+
+    @torch.no_grad()
+    def prepare_representation_rgb_target(self, video: torch.Tensor) -> list[Image.Image]:
+        """Match GT camera layout and resolution to the released RAE decoder output."""
+        if video.ndim == 4:
+            video = video.unsqueeze(0)
+        if video.ndim != 5 or int(video.shape[0]) != 1:
+            raise ValueError(f"Representation RGB target expects [1,3,T,H,W], got {tuple(video.shape)}.")
+        selected_video, _ = self._select_training_video(video)
+        camera_images = []
+        for camera_video in self.representation_encoder.split_cameras(selected_video):
+            batch, _, frames = camera_video.shape[:3]
+            images = camera_video.permute(0, 2, 1, 3, 4).reshape(
+                batch * frames, 3, camera_video.shape[-2], camera_video.shape[-1]
+            )
+            images = ((images.detach().float() + 1.0) * 0.5).clamp(0.0, 1.0)
+            camera_images.append(
+                F.interpolate(images, size=(256, 256), mode="bilinear", align_corners=False)
+            )
+        target = self._merge_square_camera_rgb(camera_images, batch=batch, frames=frames)
+        return self._video_tensor_to_pil(target)
+
+    @staticmethod
+    def _merge_square_camera_rgb(
+        camera_images: list[torch.Tensor],
+        *,
+        batch: int,
+        frames: int,
+    ) -> torch.Tensor:
+        if not camera_images:
+            raise ValueError("No camera RGB images were provided.")
+        camera_videos = []
+        for images in camera_images:
+            if images.ndim != 4 or int(images.shape[0]) != batch * frames:
+                raise ValueError(
+                    f"Camera RGB images must be [B*T,3,H,W], got {tuple(images.shape)}."
+                )
+            camera_videos.append(
+                images.reshape(batch, frames, 3, images.shape[-2], images.shape[-1]).permute(0, 2, 1, 3, 4)
+            )
+        return torch.cat(camera_videos, dim=-1).contiguous()
+
+    @staticmethod
+    def _video_tensor_to_pil(video: torch.Tensor) -> list[Image.Image]:
+        if video.ndim != 5 or int(video.shape[0]) != 1 or int(video.shape[1]) != 3:
+            raise ValueError(f"Decoded RGB video must be [1,3,T,H,W], got {tuple(video.shape)}.")
+        frames = video[0].permute(1, 2, 3, 0).mul(255.0).round().byte().cpu().numpy()
+        return [Image.fromarray(frame, mode="RGB") for frame in frames]
+
+    def _denormalize_released_camera_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        if self.normalize_target_mode != "dataset":
+            raise ValueError("RAEv2 released decoder requires representation.normalize_target='dataset'.")
+        if self.latent_mean is None or self.latent_var is None:
+            raise ValueError("RAEv2 released decoder requires loaded released dataset statistics.")
+        mean = self.latent_mean.to(device=latents.device, dtype=torch.float32)
+        var = self.latent_var.to(device=latents.device, dtype=torch.float32)
+        while mean.ndim > 3 and mean.shape[0] == 1:
+            mean = mean.squeeze(0)
+            var = var.squeeze(0)
+        if mean.shape != (self.encoder_output_dim, 16, 16) or var.shape != mean.shape:
+            raise ValueError(
+                "RAEv2 released decoder requires [1024,16,16] mean/var, "
+                f"got mean={tuple(mean.shape)} var={tuple(var.shape)}."
+            )
+        return (
+            latents.float() * torch.sqrt(var.unsqueeze(0).clamp_min(0.0) + self.latent_stats_eps)
+            + mean.unsqueeze(0)
+        ).to(dtype=self.torch_dtype)
+
+    def _get_representation_decoder(self):
+        if self.representation_decoder is None:
+            if self.representation_decoder_path is None:
+                raise ValueError("Set representation.decoder_path to the released RAEv2 decoder.pt.")
+            from fastwam.models.raev2_decoder import RAEv2GeneralDecoder
+
+            self.representation_decoder = RAEv2GeneralDecoder.from_checkpoint(
+                self.representation_decoder_path,
+                device=self.device,
+                dtype=self.torch_dtype,
+            )
+            logger.info("Loaded RAEv2 released decoder from %s.", self.representation_decoder_path)
+        return self.representation_decoder
+
+    def release_representation_decoder(self):
+        """Drop the large visualization-only decoder before training resumes."""
+        self.representation_decoder = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def _decode_camera_features_to_rgb_tensor(
+        self,
+        camera_features: list[torch.Tensor],
+    ) -> torch.Tensor:
+        decoder = self._get_representation_decoder()
+        decoded_cameras = []
+        batch = frames = None
+        for features in camera_features:
+            camera_batch, channels, camera_frames = features.shape[:3]
+            if batch is None:
+                batch, frames = int(camera_batch), int(camera_frames)
+            elif (int(camera_batch), int(camera_frames)) != (batch, frames):
+                raise ValueError("All camera feature tensors must share batch and temporal dimensions.")
+            features = features.permute(0, 2, 1, 3, 4).reshape(
+                camera_batch * camera_frames,
+                channels,
+                features.shape[-2],
+                features.shape[-1],
+            )
+            features = F.interpolate(
+                features.float(),
+                size=(16, 16),
+                mode="bilinear",
+                align_corners=False,
+            )
+            features = self._denormalize_released_camera_latents(features)
+            decoded_cameras.append(decoder(features).float().clamp(0.0, 1.0))
+        if batch is None or frames is None:
+            raise ValueError("No camera DINO features were provided for RGB decoding.")
+        return self._merge_square_camera_rgb(decoded_cameras, batch=batch, frames=frames)
+
+    @torch.no_grad()
+    def _decode_representation_latents(self, latents: torch.Tensor) -> list[Image.Image]:
+        if self.representation_codec is not None:
+            camera_features = self._decode_codec_feature_latents(latents)
+        else:
+            camera_features = self._split_representation_camera_latents(latents)
+        decoded = self._decode_camera_features_to_rgb_tensor(camera_features)
+        return self._video_tensor_to_pil(decoded)
+
     @torch.no_grad()
     def _build_mot_attention_mask(
         self,
@@ -875,6 +1452,56 @@ class RA(nn.Module):
             world_tokens_per_frame=video_tokens_per_frame,
             device=device,
             action_to_world=self.mot_action_to_world,
+        )
+
+    @torch.no_grad()
+    def _predict_joint_noise(
+        self,
+        *,
+        latents_repr: torch.Tensor,
+        latents_action: torch.Tensor,
+        timestep_repr: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if bool(getattr(self.representation_expert, "action_conditioned", False)):
+            raise ValueError("This RARAE rollout path currently supports action_conditioned=false only.")
+        if self.mot_action_to_world_enabled:
+            raise ValueError("This RARAE rollout path currently supports action_to_world=false only.")
+        repr_pre = self.representation_expert.pre_dit(
+            x=latents_repr,
+            timestep=timestep_repr,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=True,
+        )
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=latents_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+        attention_mask = self._build_mot_attention_mask(
+            video_seq_len=int(repr_pre["tokens"].shape[1]),
+            action_seq_len=int(action_pre["tokens"].shape[1]),
+            video_tokens_per_frame=int(repr_pre["meta"]["tokens_per_frame"]),
+            device=repr_pre["tokens"].device,
+        )
+        tokens_out = self.mot(
+            embeds_all={"video": repr_pre["tokens"], "action": action_pre["tokens"]},
+            attention_mask=attention_mask,
+            freqs_all={"video": repr_pre["freqs"], "action": action_pre["freqs"]},
+            context_all={
+                "video": {"context": repr_pre["context"], "mask": repr_pre["context_mask"]},
+                "action": {"context": action_pre["context"], "mask": action_pre["context_mask"]},
+            },
+            t_mod_all={"video": repr_pre["t_mod"], "action": action_pre["t_mod"]},
+        )
+        return (
+            self.representation_expert.post_dit(tokens_out["video"], repr_pre),
+            self.action_expert.post_dit(tokens_out["action"], action_pre),
         )
 
     def _compute_representation_loss_per_sample(
@@ -1122,14 +1749,27 @@ class RA(nn.Module):
             action_scheduler=self.train_action_scheduler,
         )
 
-        loss_total = self.loss_lambda_representation * loss_repr + self.loss_lambda_action * loss_action
+        loss_decoder_raw = self._codec_decoder_training_loss(
+            representation_latents=representation_latents,
+            feature_targets=inputs["codec_feature_targets"],
+        )
+        loss_decoder = self.codec_decoder_loss_weight * loss_decoder_raw
+
+        loss_total = (
+            self.loss_lambda_representation * loss_repr
+            + self.loss_lambda_action * loss_action
+            + loss_decoder
+        )
         loss_dict = {
             "loss_representation": self.loss_lambda_representation * float(loss_repr.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+            "loss_codec_decoder": float(loss_decoder.detach().item()),
             "conditioning/action_enabled": float(
                 bool(getattr(self.representation_expert, "action_conditioned", False))
             ),
             "conditioning/mot_action_to_world_enabled": float(self.mot_action_to_world_enabled),
+            "repr/codec_enabled": float(self.representation_codec_enabled),
+            "repr/codec_dim": float(self.target_dim),
         }
         loss_dict.update(
             self._representation_monitor_metrics(
@@ -1145,6 +1785,122 @@ class RA(nn.Module):
             )
         )
         return loss_total, loss_dict
+
+    @torch.no_grad()
+    def infer_joint(
+        self,
+        prompt: Optional[str],
+        input_image: torch.Tensor,
+        num_video_frames: int,
+        action_horizon: int,
+        action: Optional[torch.Tensor] = None,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        negative_prompt: Optional[str] = None,
+        text_cfg_scale: float = 1.0,
+        num_inference_steps: int = 20,
+        sigma_shift: Optional[float] = None,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
+        tiled: bool = False,
+    ) -> dict[str, Any]:
+        del action, negative_prompt, text_cfg_scale, tiled
+        self.eval()
+        num_repr_steps = self._num_inference_representation_steps(num_video_frames)
+        if input_image.ndim == 3:
+            input_image = input_image.unsqueeze(0)
+        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+            raise ValueError(
+                f"`input_image` must be [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+            )
+        if proprio is not None:
+            if self.proprio_dim is None:
+                raise ValueError("`proprio` was provided but `proprio_dim=None` so `proprio_encoder` is disabled.")
+            if proprio.ndim == 1:
+                proprio = proprio.unsqueeze(0)
+            elif proprio.ndim != 2 or proprio.shape[0] != 1:
+                raise ValueError(f"`proprio` must be [D] or [1,D], got {tuple(proprio.shape)}")
+            if proprio.shape[1] != self.proprio_dim:
+                raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}")
+            proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
+
+        context, context_mask = self._prepare_context(
+            prompt=prompt,
+            context=context,
+            context_mask=context_mask,
+            proprio=proprio,
+            batch_size=1,
+        )
+        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+        first_frame_repr = self._encode_inference_first_frame_latents(input_image)
+        _, repr_dim, _, repr_h, repr_w = first_frame_repr.shape
+
+        repr_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+        action_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+        latents_repr = torch.randn(
+            (1, repr_dim, num_repr_steps, repr_h, repr_w),
+            generator=repr_generator,
+            device=rand_device,
+            dtype=torch.float32,
+        ).to(device=self.device, dtype=self.torch_dtype)
+        latents_action = torch.randn(
+            (1, int(action_horizon), self.action_expert.action_dim),
+            generator=action_generator,
+            device=rand_device,
+            dtype=torch.float32,
+        ).to(device=self.device, dtype=self.torch_dtype)
+        latents_repr[:, :, 0:1] = first_frame_repr
+
+        infer_timesteps_repr, infer_deltas_repr = self.infer_representation_scheduler.build_inference_schedule(
+            num_inference_steps=int(num_inference_steps),
+            device=self.device,
+            dtype=latents_repr.dtype,
+            shift_override=sigma_shift,
+        )
+        infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
+            num_inference_steps=int(num_inference_steps),
+            device=self.device,
+            dtype=latents_action.dtype,
+            shift_override=sigma_shift,
+        )
+        if len(infer_timesteps_repr) != len(infer_timesteps_action):
+            raise ValueError("Representation/action inference schedules must have the same number of steps.")
+        for step_t_repr, step_delta_repr, step_t_action, step_delta_action in zip(
+            infer_timesteps_repr,
+            infer_deltas_repr,
+            infer_timesteps_action,
+            infer_deltas_action,
+        ):
+            pred_repr, pred_action = self._predict_joint_noise(
+                latents_repr=latents_repr,
+                latents_action=latents_action,
+                timestep_repr=step_t_repr.unsqueeze(0).to(device=self.device, dtype=latents_repr.dtype),
+                timestep_action=step_t_action.unsqueeze(0).to(device=self.device, dtype=latents_action.dtype),
+                context=context,
+                context_mask=context_mask,
+            )
+            latents_repr = self.infer_representation_scheduler.step(
+                pred_repr,
+                step_delta_repr,
+                latents_repr,
+            )
+            latents_action = self.infer_action_scheduler.step(
+                pred_action,
+                step_delta_action,
+                latents_action,
+            )
+            latents_repr[:, :, 0:1] = first_frame_repr
+
+        decode_latents = latents_repr
+        if self.representation_state_space == "delta":
+            decode_latents = latents_repr.clone()
+            decode_latents[:, :, 1:] = first_frame_repr + latents_repr[:, :, 1:]
+        return {
+            "video": self._decode_representation_latents(decode_latents),
+            "representation": decode_latents.detach().to(device="cpu", dtype=torch.float32),
+            "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
+        }
 
     @torch.no_grad()
     def infer_action(
@@ -1308,6 +2064,10 @@ class RA(nn.Module):
         }
         if self.proprio_encoder is not None:
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
+        if self.representation_codec is not None:
+            payload["representation_codec"] = self.representation_codec.state_dict()
+        if self.codec_decoder is not None:
+            payload["codec_decoder"] = self.codec_decoder.state_dict()
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
@@ -1324,6 +2084,23 @@ class RA(nn.Module):
                 logger.warning("Checkpoint has no `proprio_encoder` weights; keeping current params.")
         elif "proprio_encoder" in payload:
             logger.warning("Checkpoint contains `proprio_encoder`, but current model disables it; ignoring.")
+        if self.representation_codec is not None:
+            if "representation_codec" in payload:
+                self.representation_codec.load_state_dict(payload["representation_codec"], strict=True)
+            else:
+                logger.warning(
+                    "Checkpoint has no `representation_codec` state; keeping the deterministic codec "
+                    "initialized from the current config seed."
+                )
+        elif "representation_codec" in payload:
+            logger.warning("Checkpoint contains `representation_codec`, but current model disables it; ignoring.")
+        if self.codec_decoder is not None:
+            if "codec_decoder" in payload:
+                self.codec_decoder.load_state_dict(payload["codec_decoder"], strict=True)
+            else:
+                logger.warning("Checkpoint has no `codec_decoder` weights; keeping the initialized decoder.")
+        elif "codec_decoder" in payload:
+            logger.warning("Checkpoint contains `codec_decoder`, but current model disables it; ignoring.")
         if optimizer is not None and "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])
         return payload

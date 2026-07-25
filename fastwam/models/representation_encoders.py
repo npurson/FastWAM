@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -33,12 +33,14 @@ class BaseRepresentationEncoder(nn.Module):
         output_dim: int,
         camera_layout: str = "none",
         num_cameras: int = 1,
+        resize_input: bool = True,
     ):
         super().__init__()
         self.input_size = as_hw(input_size, input_size)
         self.output_dim = int(output_dim)
         self.camera_layout = str(camera_layout).lower()
         self.num_cameras = int(num_cameras)
+        self.resize_input = bool(resize_input)
         self._target_dtype: Optional[torch.dtype] = None
 
     @property
@@ -137,7 +139,8 @@ class BaseRepresentationEncoder(nn.Module):
         x = x.clamp(0.0, 1.0)
         batch_size, _, num_frames, _, _ = x.shape
         x = rearrange(x, "b c t h w -> (b t) c h w")
-        x = F.interpolate(x, size=self.input_size, mode="bilinear", align_corners=False)
+        if self.resize_input:
+            x = F.interpolate(x, size=self.input_size, mode="bilinear", align_corners=False)
         return x, batch_size, num_frames
 
     def _normalize_imagenet(self, images: torch.Tensor) -> torch.Tensor:
@@ -269,10 +272,17 @@ class BaseRepresentationEncoder(nn.Module):
         return model
 
     @torch.inference_mode()
-    def forward_pixels(self, video: torch.Tensor) -> torch.Tensor:
+    def forward_pixels(
+        self,
+        video: torch.Tensor,
+        camera_feature_transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    ) -> torch.Tensor:
         camera_features = []
         for camera_video in self.split_cameras(video):
-            camera_features.append(self.forward_camera_dense(camera_video))
+            feature = self.forward_camera_dense(camera_video)
+            if camera_feature_transform is not None:
+                feature = camera_feature_transform(feature)
+            camera_features.append(feature)
         return self.merge_camera_features(camera_features)
 
     @torch.inference_mode()
@@ -486,14 +496,17 @@ class DINORepresentationEncoder(BaseRepresentationEncoder):
         input_size: tuple[int, int] = (512, 512),
         patch_size: int = 16,
         output_dim: int = 768,
+        norm_affine: bool = True,
         camera_layout: str = "none",
         num_cameras: int = 1,
+        resize_input: bool = True,
     ):
         super().__init__(
             input_size=input_size,
             output_dim=output_dim,
             camera_layout=camera_layout,
             num_cameras=num_cameras,
+            resize_input=resize_input,
         )
         self.model_name = model_name
         self.model_id = model_id
@@ -502,6 +515,7 @@ class DINORepresentationEncoder(BaseRepresentationEncoder):
         self.hub_source = hub_source
         self.hub_kwargs = as_plain_dict(hub_kwargs)
         self.patch_size = int(patch_size)
+        self.norm_affine = bool(norm_affine)
 
     def _load(self, device: torch.device):
         if self.model is not None:
@@ -519,6 +533,16 @@ class DINORepresentationEncoder(BaseRepresentationEncoder):
             model = AutoModel.from_pretrained(self.model_id, trust_remote_code=True)
         else:
             raise ValueError(f"Unsupported DINO backend: {self.backend}")
+        if not self.norm_affine:
+            if not hasattr(model, "norm"):
+                raise ValueError("DINO non-affine output normalization requires the model to expose `norm`.")
+            embed_dim = int(getattr(model, "embed_dim", self.output_dim))
+            if embed_dim != self.output_dim:
+                raise ValueError(
+                    "DINO model embed dim must match configured output_dim before replacing output norm: "
+                    f"model={embed_dim}, configured={self.output_dim}."
+                )
+            model.norm = nn.LayerNorm(embed_dim, eps=1e-5, elementwise_affine=False)
         self._set_teacher_model(
             self._freeze_loaded_model(model.to(**self._model_to_kwargs(device)))
         )
@@ -529,8 +553,8 @@ class DINORepresentationEncoder(BaseRepresentationEncoder):
         images, batch_size, num_frames = self._video_to_images(video)
         images = self._normalize_imagenet(images)
         images = self._cast_teacher_input(images)
-        feat_h = self.input_size[0] // self.patch_size
-        feat_w = self.input_size[1] // self.patch_size
+        feat_h = int(images.shape[-2]) // self.patch_size
+        feat_w = int(images.shape[-1]) // self.patch_size
         spatial_tokens = feat_h * feat_w
         if self.backend == "hub":
             out = self.model.forward_features(images) if hasattr(self.model, "forward_features") else self.model(images)
@@ -560,7 +584,7 @@ class DINORepresentationEncoder(BaseRepresentationEncoder):
 
 
 class DINOMultiLayerSumRepresentationEncoder(DINORepresentationEncoder):
-    """DINO/DINOv3 dense features from a sum of normalized intermediate layers."""
+    """RAEv2-style normalized multi-layer DINO/DINOv3 dense features."""
 
     def __init__(
         self,
@@ -568,6 +592,7 @@ class DINOMultiLayerSumRepresentationEncoder(DINORepresentationEncoder):
         layers: Optional[list[int]] = None,
         **kwargs,
     ):
+        kwargs.setdefault("norm_affine", False)
         super().__init__(*args, **kwargs)
         if layers in (None, [], ""):
             layers = [11, 13, 15, 17, 19, 21, 23]
@@ -580,8 +605,9 @@ class DINOMultiLayerSumRepresentationEncoder(DINORepresentationEncoder):
         self._load(video.device)
         images, batch_size, num_frames = self._video_to_images(video)
         images = self._normalize_imagenet(images)
-        feat_h = self.input_size[0] // self.patch_size
-        feat_w = self.input_size[1] // self.patch_size
+        images = self._cast_teacher_input(images)
+        feat_h = int(images.shape[-2]) // self.patch_size
+        feat_w = int(images.shape[-1]) // self.patch_size
         spatial_tokens = feat_h * feat_w
 
         if self.backend != "hub":
@@ -610,7 +636,8 @@ class DINOMultiLayerSumRepresentationEncoder(DINORepresentationEncoder):
                 raise ValueError(f"DINO intermediate output must be [B,N,C], got {tuple(output.shape)}.")
             output = strip_prefix_tokens(output, spatial_tokens, "DINO-MLS")
             layer_tokens.append(output)
-        tokens = torch.stack(layer_tokens, dim=0).sum(dim=0)
+        tokens = torch.stack(layer_tokens, dim=0).mean(dim=0)
+        tokens = tokens + layer_tokens[-1].mean(dim=1, keepdim=True)
         return self._tokens_to_dense(
             tokens,
             batch_size=batch_size,

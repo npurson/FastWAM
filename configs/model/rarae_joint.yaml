@@ -1,0 +1,6 @@
+defaults:
+  - rarae
+  - _self_
+
+_target_: fastwam.runtime.create_ra_joint
+

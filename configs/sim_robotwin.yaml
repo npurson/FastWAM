@@ -32,7 +32,12 @@ EVALUATION:
   rand_device: cpu
   tiled: false
   timing_enabled: false
+  # Always fetch an observation for replanning. Sample this fraction of
+  # episodes to fetch observations at every action step for smooth eval video.
   skip_get_obs_within_replan: true
+  full_obs_episode_probability: 0.1
+  visualize_future_video: false
+  future_video_max_episodes: 1
 
   # Runtime inputs
   dataset_stats_path: null

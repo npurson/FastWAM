@@ -289,8 +289,23 @@ def main(cfg: DictConfig):
     _append_override(overrides, "timing_enabled", cfg.EVALUATION.timing_enabled)
     _append_override(
         overrides,
+        "visualize_future_video",
+        cfg.EVALUATION.visualize_future_video,
+    )
+    _append_override(
+        overrides,
+        "future_video_max_episodes",
+        cfg.EVALUATION.future_video_max_episodes,
+    )
+    _append_override(
+        overrides,
         "skip_get_obs_within_replan",
         cfg.EVALUATION.skip_get_obs_within_replan,
+    )
+    _append_override(
+        overrides,
+        "full_obs_episode_probability",
+        cfg.EVALUATION.full_obs_episode_probability,
     )
 
     cmd = [
