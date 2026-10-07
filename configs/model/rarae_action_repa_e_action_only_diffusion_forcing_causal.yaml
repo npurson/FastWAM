@@ -1,0 +1,9 @@
+defaults:
+  - rarae_action_repa_e_condition_diffusion_forcing_causal@_here_
+  - _self_
+
+# D: strict action-only codec update. World/action DiT still receive their
+# ordinary losses, while only the action-to-current-latent VJP reaches codec.
+representation:
+  codec:
+    gradient_mode: action_only

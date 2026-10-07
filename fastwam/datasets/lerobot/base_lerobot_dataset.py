@@ -33,6 +33,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
 
         # sampling
         global_sample_stride: int = 1,
+        image_offsets: Optional[List[int]] = None,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
         assert past_action_size == 0
@@ -57,6 +58,9 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         fps = fps_list[0]
         
         self.global_sample_stride = global_sample_stride
+        self.image_offsets = None if image_offsets is None else [int(v) for v in image_offsets]
+        if self.image_offsets is not None and not self.image_offsets:
+            raise ValueError("`image_offsets` must be non-empty when provided.")
 
         self.val_set_proportion = val_set_proportion
         self.is_training_set = is_training_set
@@ -69,8 +73,13 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         for meta in self.image_meta:
             key = meta["key"]
             meta["lerobot_key"] = f"observation.images.{key}" if key != "default" else "observation.images"
+            image_steps = (
+                self.image_offsets
+                if self.image_offsets is not None
+                else list(range(-past_obs_size, -past_obs_size + obs_size))
+            )
             delta_timestamps[meta["lerobot_key"]] = [
-                (t * global_sample_stride) / fps for t in range(-past_obs_size, -past_obs_size + obs_size)
+                (t * global_sample_stride) / fps for t in image_steps
             ]
         
         for meta in self.state_meta:

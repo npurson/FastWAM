@@ -117,6 +117,64 @@ def _compose_sim_cfg(
     return cfg
 
 
+def _load_sim_cfg(
+    resolved_sim_cfg_path: Optional[str],
+    sim_cfg_path: Optional[str],
+    sim_cfg_name: Optional[str],
+    sim_task: Optional[str],
+) -> DictConfig:
+    if _is_none_like(resolved_sim_cfg_path):
+        return _compose_sim_cfg(
+            sim_cfg_path=sim_cfg_path,
+            sim_cfg_name=sim_cfg_name,
+            sim_task=sim_task,
+        )
+
+    config_path = Path(str(resolved_sim_cfg_path)).expanduser().resolve()
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Resolved simulation config not found: {config_path}")
+    cfg = OmegaConf.load(config_path)
+    if not isinstance(cfg, DictConfig):
+        raise TypeError(
+            f"Resolved simulation config must be a mapping, got {type(cfg).__name__}: "
+            f"{config_path}"
+        )
+    logger.info("Loaded resolved simulation config: %s", config_path)
+    return cfg
+
+
+def _configured_video_attention_mask_mode(model_cfg: DictConfig) -> Optional[str]:
+    for key in ("representation_dit_config", "video_dit_config"):
+        mode = OmegaConf.select(model_cfg, f"{key}.video_attention_mask_mode")
+        if not _is_none_like(mode):
+            return str(mode)
+    return None
+
+
+def _validate_video_attention_mask_mode(model: Any, model_cfg: DictConfig) -> Optional[str]:
+    expected = _configured_video_attention_mask_mode(model_cfg)
+    world_expert = getattr(
+        model,
+        "representation_expert",
+        getattr(model, "video_expert", None),
+    )
+    actual_value = getattr(world_expert, "video_attention_mask_mode", None)
+    actual = None if _is_none_like(actual_value) else str(actual_value)
+
+    if expected is not None and actual != expected:
+        raise RuntimeError(
+            "Video attention mask mode mismatch after model construction: "
+            f"config={expected!r}, model={actual!r}. Refusing to run evaluation "
+            "with a silently changed attention mask."
+        )
+    logger.info(
+        "Video attention mask mode: config=%s model=%s",
+        expected,
+        actual,
+    )
+    return actual
+
+
 def _resolve_dataset_stats_path(dataset_stats_path: Optional[str]) -> Path:
     if _is_none_like(dataset_stats_path):
         raise FileNotFoundError(
@@ -135,6 +193,22 @@ def _resize_rgb(image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
     return np.asarray(resized, dtype=np.uint8)
 
 
+def _get_num_video_frames(cfg: DictConfig) -> int:
+    """Return source frames expected by inference, including codec history."""
+    num_frames = int(cfg.data.train.num_frames)
+    action_video_freq_ratio = int(cfg.data.train.action_video_freq_ratio)
+    if action_video_freq_ratio <= 0:
+        raise ValueError("data.train.action_video_freq_ratio must be positive.")
+    if (num_frames - 1) % action_video_freq_ratio != 0:
+        raise ValueError(
+            "data.train.num_frames-1 must be divisible by action_video_freq_ratio, got "
+            f"{num_frames - 1} and {action_video_freq_ratio}."
+        )
+    current_and_future_frames = (num_frames - 1) // action_video_freq_ratio + 1
+    history_frames = int(bool(cfg.data.train.get("include_previous_video_frame", False)))
+    return current_and_future_frames + history_frames
+
+
 class WorldActionRobotWinPolicy:
     def __init__(
         self,
@@ -146,6 +220,7 @@ class WorldActionRobotWinPolicy:
         model_dtype: torch.dtype,
         action_horizon: int,
         replan_steps: int,
+        action_video_freq_ratio: int,
         num_inference_steps: int,
         sigma_shift: Optional[float],
         seed: Optional[int],
@@ -165,6 +240,7 @@ class WorldActionRobotWinPolicy:
         model_cfg_copy.load_text_encoder = True
 
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
+        _validate_video_attention_mask_mode(self.model, model_cfg_copy)
         self.model.load_checkpoint(checkpoint_path)
         self.model = self.model.to(device).eval()
 
@@ -174,6 +250,17 @@ class WorldActionRobotWinPolicy:
 
         self.action_horizon = int(action_horizon)
         self.replan_steps = int(max(1, min(replan_steps, action_horizon)))
+        self.action_video_freq_ratio = int(action_video_freq_ratio)
+        if self.action_video_freq_ratio <= 0:
+            raise ValueError("action_video_freq_ratio must be positive.")
+        self.uses_previous_video_frame = bool(
+            getattr(self.model, "representation_codec_uses_history", False)
+        )
+        if self.uses_previous_video_frame and self.replan_steps < self.action_video_freq_ratio:
+            raise ValueError(
+                "History-aware codec requires replan_steps >= action_video_freq_ratio, got "
+                f"{self.replan_steps} and {self.action_video_freq_ratio}."
+            )
         self.num_inference_steps = int(num_inference_steps)
         self.sigma_shift = sigma_shift
         self.seed = seed
@@ -183,6 +270,12 @@ class WorldActionRobotWinPolicy:
         self.tiled = bool(tiled)
         self.timing_enabled = bool(timing_enabled)
         self._num_video_frames = int(num_video_frames)
+        validate_timeline = getattr(self.model, "validate_inference_timeline", None)
+        if callable(validate_timeline):
+            validate_timeline(
+                num_video_frames=self._num_video_frames,
+                action_horizon=self.action_horizon,
+            )
         self.full_obs_episode_probability = float(full_obs_episode_probability)
         if not 0.0 <= self.full_obs_episode_probability <= 1.0:
             raise ValueError(
@@ -197,9 +290,15 @@ class WorldActionRobotWinPolicy:
         if self.visualize_future_video:
             if self.future_video_max_episodes <= 0:
                 raise ValueError("future_video_max_episodes must be positive when visualization is enabled.")
+            has_codec_decoder = getattr(self.model, "has_codec_decoder", None)
+            codec_decoder_available = (
+                bool(has_codec_decoder())
+                if callable(has_codec_decoder)
+                else getattr(self.model, "codec_decoder", None) is not None
+            )
             if (
                 getattr(self.model, "representation_codec", None) is not None
-                and getattr(self.model, "codec_decoder", None) is None
+                and not codec_decoder_available
             ):
                 raise ValueError(
                     "visualize_future_video=true is unavailable for the frozen random representation codec "
@@ -221,6 +320,7 @@ class WorldActionRobotWinPolicy:
             self.future_video_dir.mkdir(parents=True, exist_ok=True)
 
         self.pending_actions: deque[np.ndarray] = deque()
+        self._history_image_tensor: Optional[torch.Tensor] = None
         self.episode_count = 0
         self.step_count = 0
         self.replan_count = 0
@@ -307,6 +407,13 @@ class WorldActionRobotWinPolicy:
 
     def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
         image_tensor = self._build_robotwin_image_tensor(observation)
+        previous_image_tensor = None
+        if self.uses_previous_video_frame:
+            previous_image_tensor = (
+                image_tensor
+                if self._history_image_tensor is None
+                else self._history_image_tensor
+            )
         state_vector = np.asarray(observation["joint_action"]["vector"], dtype=np.float32)
         proprio = self._normalize_state(state_vector)
 
@@ -324,6 +431,8 @@ class WorldActionRobotWinPolicy:
             "rand_device": self.rand_device,
             "tiled": self.tiled,
         }
+        if previous_image_tensor is not None:
+            infer_kwargs["previous_image"] = previous_image_tensor
         capture_future = (
             self.visualize_future_video
             and self.episode_count > 0
@@ -342,6 +451,8 @@ class WorldActionRobotWinPolicy:
                 pred = self.model.infer_action(**infer_kwargs)
         if self.timing_enabled:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
+        if self.uses_previous_video_frame:
+            self._history_image_tensor = None
 
         action_tensor = pred["action"]  # [T, D]
         action_chunk = self._denormalize_action(action_tensor)[0]  # [T, D]
@@ -355,14 +466,34 @@ class WorldActionRobotWinPolicy:
         n_exec = min(self.replan_steps, action_chunk.shape[0])
         for i in range(n_exec):
             self.pending_actions.append(np.asarray(action_chunk[i], dtype=np.float32))
+        if self.uses_previous_video_frame and n_exec == self.action_video_freq_ratio:
+            # When one chunk spans exactly one RGB interval, the current
+            # replan observation is the next replan's previous frame.
+            self._history_image_tensor = self._build_robotwin_image_tensor(observation)
 
     def should_request_observation(self) -> bool:
-        return self._full_obs_episode or not self.pending_actions
+        history_refresh = (
+            self.uses_previous_video_frame
+            and len(self.pending_actions) == self.action_video_freq_ratio
+        )
+        return self._full_obs_episode or not self.pending_actions or history_refresh
 
     def get_observation_refresh_mode(self) -> str:
-        return "full" if self._full_obs_episode else "replan-only"
+        if self._full_obs_episode:
+            return "full"
+        return "replan+history" if self.uses_previous_video_frame else "replan-only"
 
     def step(self, task_env, observation: Optional[Dict[str, Any]]) -> None:
+        if (
+            self.uses_previous_video_frame
+            and self.pending_actions
+            and len(self.pending_actions) == self.action_video_freq_ratio
+        ):
+            if observation is None:
+                raise ValueError(
+                    "Observation is required at the history refresh step for the history-aware codec."
+                )
+            self._history_image_tensor = self._build_robotwin_image_tensor(observation)
         if not self.pending_actions:
             if observation is None:
                 raise ValueError(
@@ -395,6 +526,7 @@ class WorldActionRobotWinPolicy:
 
     def reset(self) -> None:
         self.pending_actions.clear()
+        self._history_image_tensor = None
         self.episode_count += 1
         self.step_count = 0
         self.replan_count = 0
@@ -414,10 +546,12 @@ def encode_obs(observation: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]
 
 
 def get_model(usr_args: Dict[str, Any]):
+    resolved_sim_cfg_path = usr_args.get("resolved_sim_cfg_path")
     sim_cfg_path = usr_args.get("sim_cfg_path")
     sim_cfg_name = usr_args.get("sim_cfg_name")
     sim_task = usr_args.get("sim_task")
-    cfg = _compose_sim_cfg(
+    cfg = _load_sim_cfg(
+        resolved_sim_cfg_path=resolved_sim_cfg_path,
         sim_cfg_path=sim_cfg_path,
         sim_cfg_name=sim_cfg_name,
         sim_task=sim_task,
@@ -499,6 +633,7 @@ def get_model(usr_args: Dict[str, Any]):
         model_dtype=model_dtype,
         action_horizon=action_horizon,
         replan_steps=replan_steps,
+        action_video_freq_ratio=int(cfg.data.train.action_video_freq_ratio),
         num_inference_steps=num_inference_steps,
         sigma_shift=sigma_shift,
         seed=seed,
@@ -507,7 +642,7 @@ def get_model(usr_args: Dict[str, Any]):
         rand_device=rand_device,
         tiled=tiled,
         timing_enabled=timing_enabled,
-        num_video_frames=(int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1,
+        num_video_frames=_get_num_video_frames(cfg),
         full_obs_episode_probability=full_obs_episode_probability,
         visualize_future_video=visualize_future_video,
         future_video_max_episodes=future_video_max_episodes,

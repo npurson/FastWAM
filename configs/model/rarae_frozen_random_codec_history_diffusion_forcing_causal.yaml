@@ -1,0 +1,17 @@
+defaults:
+  - rarae_frozen_random_codec_diffusion_forcing_causal@_here_
+  - _self_
+
+# B: frozen-random control with a real previous sampled frame. Ten source
+# frames form five homogeneous pairs; no temporal zero padding is used.
+representation:
+  state_space: absolute
+  temporal_groups:
+    - [0, 1]
+    - [2, 3]
+    - [4, 5]
+    - [6, 7]
+    - [8, 9]
+  codec:
+    temporal_padding: none
+

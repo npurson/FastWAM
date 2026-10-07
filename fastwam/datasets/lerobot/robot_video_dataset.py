@@ -38,11 +38,38 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         is_training_set=False,
         global_sample_stride=1,
         action_video_freq_ratio: int = 1,
+        include_previous_video_frame: bool = False,
+        history_repeat_probability: float = 0.0,
         skip_padding_as_possible: bool = False,
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
     ):
+        action_video_freq_ratio = int(action_video_freq_ratio)
+        include_previous_video_frame = bool(include_previous_video_frame)
+        if action_video_freq_ratio <= 0:
+            raise ValueError("`action_video_freq_ratio` must be positive.")
+        if (num_frames - 1) % action_video_freq_ratio != 0:
+            raise ValueError(
+                "num_frames-1 must be divisible by action_video_freq_ratio, got "
+                f"{num_frames - 1} and {action_video_freq_ratio}."
+            )
+        if ((num_frames - 1) // action_video_freq_ratio) % 4 != 0:
+            raise ValueError(
+                "video transitions must be divisible by 4 for tokenization, got "
+                f"{(num_frames - 1) // action_video_freq_ratio}."
+            )
+        if include_previous_video_frame:
+            image_offsets = [-action_video_freq_ratio] + list(
+                range(0, num_frames, action_video_freq_ratio)
+            )
+            video_sample_indices = list(range(len(image_offsets)))
+            processor_image_steps = len(image_offsets)
+        else:
+            image_offsets = None
+            video_sample_indices = list(range(0, num_frames, action_video_freq_ratio))
+            processor_image_steps = num_frames
+
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
@@ -51,16 +78,21 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             val_set_proportion=val_set_proportion,
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
+            image_offsets=image_offsets,
         )
     
         self.num_frames = num_frames
         self.action_video_freq_ratio = action_video_freq_ratio
-        
-        assert (num_frames - 1) % self.action_video_freq_ratio == 0, \
-            f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
-        assert ((num_frames - 1) // self.action_video_freq_ratio) % 4 == 0, \
-            f"video frames must be divisible by 4 for tokenization, got {(num_frames - 1) // self.action_video_freq_ratio}"
-        self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio))
+        self.is_training_set = bool(is_training_set)
+        self.include_previous_video_frame = include_previous_video_frame
+        self.history_repeat_probability = float(history_repeat_probability)
+        if not 0.0 <= self.history_repeat_probability <= 1.0:
+            raise ValueError(
+                "`history_repeat_probability` must be in [0, 1], got "
+                f"{self.history_repeat_probability}."
+            )
+        self.video_sample_indices = video_sample_indices
+        self.num_future_video_transitions = (num_frames - 1) // action_video_freq_ratio
 
         self.camera_key = camera_key
         self.lerobot_dataset._set_return_images(True)
@@ -84,7 +116,13 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         )
         if processor is not None:
             if isinstance(processor, DictConfig):
+                processor = OmegaConf.merge(
+                    processor,
+                    {"num_image_obs_steps": processor_image_steps},
+                )
                 processor = instantiate(processor)
+            elif hasattr(processor, "num_image_obs_steps"):
+                processor.num_image_obs_steps = int(processor_image_steps)
             if not pretrained_norm_stats:
                 if not is_training_set:
                     raise ValueError("pretrained_norm_stats must be provided for validation/test sets since we don't want to calculate stats on them.")
@@ -150,6 +188,20 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             T_video, C, H, W = video.shape
         image_is_pad = image_is_pad[self.video_sample_indices]
 
+        if (
+            self.include_previous_video_frame
+            and self.is_training_set
+            and self.history_repeat_probability > 0.0
+            and np.random.rand() < self.history_repeat_probability
+        ):
+            video = video.clone()
+            if video.ndim == 5:
+                video[:, 0] = video[:, 1]
+            else:
+                video[0] = video[1]
+            image_is_pad = image_is_pad.clone()
+            image_is_pad[0] = image_is_pad[1]
+
         video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
         if self.concat_multi_camera == "robotwin":
             if num_cameras != 3:
@@ -203,9 +255,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         proprio = sample["proprio"][:-1, :] # [T-1, state_dim]， to align with action
         if video.shape[1] <= 1:
             raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
-        if action.shape[0] % (video.shape[1] - 1) != 0:
+        if action.shape[0] % self.num_future_video_transitions != 0:
             raise ValueError(
-                f"`action` horizon must be divisible by `video` transitions, got {action.shape[0]} and {video.shape[1] - 1}"
+                "`action` horizon must be divisible by future video transitions, got "
+                f"{action.shape[0]} and {self.num_future_video_transitions}."
             )
 
         task = sample["instruction"]

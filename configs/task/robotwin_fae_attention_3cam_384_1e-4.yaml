@@ -2,7 +2,7 @@
 
 defaults:
   - override /data: robotwin_horizon64_stride8
-  - override /model: rarae_action_repa_e_action_only_diffusion_forcing_causal
+  - override /model: rarae_fae_attention_action_only_diffusion_forcing_causal
   - _self_
 
 # dataloading

@@ -1,0 +1,18 @@
+defaults:
+  - robotwin
+  - _self_
+
+# Double the action horizon while halving the RGB sampling rate:
+# 64 actions sampled at the original control rate, with RGB frames at
+# timesteps [0, 8, 16, ..., 64] (9 frames total).
+train:
+  num_frames: 65
+  action_video_freq_ratio: 8
+  include_previous_video_frame: true
+  history_repeat_probability: 0.1
+
+val:
+  include_previous_video_frame: true
+  history_repeat_probability: 0.0
+  num_frames: 65
+  action_video_freq_ratio: 8

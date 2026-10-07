@@ -1,0 +1,6 @@
+defaults:
+  - rarae_frozen_random_codec_diffusion_forcing@_here_
+  - _self_
+
+representation_dit_config:
+  video_attention_mask_mode: per_frame_causal

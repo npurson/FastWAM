@@ -284,7 +284,17 @@ def _validate_visualize_future_video_cfg(cfg: DictConfig) -> None:
     if not bool(cfg.EVALUATION.get("visualize_future_video", False)):
         return
 
-    action_conditioned = cfg.model.video_dit_config.get("action_conditioned", None)
+    representation_cfg = cfg.model.get("representation", {})
+    codec_cfg = representation_cfg.get("codec", {})
+    decoder_cfg = codec_cfg.get("decoder", {})
+    if bool(codec_cfg.get("enabled", False)) and not bool(decoder_cfg.get("enabled", False)):
+        raise ValueError(
+            "EVALUATION.visualize_future_video=true is unavailable when "
+            "model.representation.codec.enabled=true without codec.decoder.enabled=true."
+        )
+
+    world_dit_config = cfg.model.get("video_dit_config", cfg.model.get("representation_dit_config", {}))
+    action_conditioned = world_dit_config.get("action_conditioned", None)
     if action_conditioned is not False:
         raise ValueError(
             "EVALUATION.visualize_future_video=true requires "

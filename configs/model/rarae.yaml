@@ -11,6 +11,9 @@ skip_dit_load_from_pretrain: false
 
 representation:
   target_dim: ${model.representation.codec.output_dim}
+  # Baseline samples one noise timestep per sample. Diffusion-Forcing variants
+  # override this with `per_frame` to sample independent [B, T] timesteps.
+  noise_timestep_mode: shared
   # The dataset already samples the FastWAM 9-frame clip at action steps
   # [0,4,...,32]. The causal 2x codec keeps frame 0 as a singleton and packs
   # each following pair, producing five representation steps.
@@ -25,9 +28,10 @@ representation:
   # Post-codec spatial size after native-resolution cameras are encoded and
   # concatenated without mixing camera seams.
   latent_spatial_size: [12, 10]
-  normalize_target: dataset
-  latent_stats_path: /horizon-bucket/robot_lab/users/haoyi.jiang/repos/fastwam/checkpoints/RAEv2/stats.pt
-  latent_stats_eps: 1.0e-05
+  # DINO MLS already applies its own non-affine output LayerNorm. RAEv2's
+  # ImageNet feature statistics describe the pre-codec 1024x16x16 feature and
+  # are intentionally not applied to the 512-channel diffusion target.
+  normalize_target: none
   decoder_path: /horizon-bucket/robot_lab/users/haoyi.jiang/repos/fastwam/checkpoints/RAEv2/decoder.pt
   encoder:
     name: dino_mls
@@ -50,18 +54,23 @@ representation:
   codec:
     enabled: true
     type: frozen_random
-    # Used only when type=learned; retained here so cluster overrides can also
-    # switch back to the frozen-random model without changing their CLI shape.
-    checkpoint_path: null
-    output_dim: 512
+    output_dim: 128
     kernel_size: [2, 2, 2]
     stride: [2, 2, 2]
     seed: 0
-    norm_eps: 1.0e-06
+    # Normalize the actual codec latent immediately before diffusion. The
+    # lagged running-stat update avoids future-to-current leakage and has no
+    # learnable affine scale or bias.
+    latent_norm:
+      enabled: true
+      type: causal_running
+      eps: 1.0e-05
+      momentum: 0.1
     decoder:
       enabled: true
-      # Online branch only inverts the frozen codec back to normalized DINO
-      # features. The frozen released RAEv2 decoder converts those to RGB.
+      # This decoder consumes stop-gradient raw codec latents and reconstructs
+      # raw DINO MLS features. RunningNorm is only a diffusion interface.
+      trainable: true
       loss_weight: 1.0
 
 representation_dit_config:

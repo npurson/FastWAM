@@ -489,7 +489,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         try:
             if force_cache_sync:
                 raise FileNotFoundError
-            assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())
+            # assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())
             self.hf_dataset = self.load_hf_dataset()
         except (AssertionError, FileNotFoundError, NotADirectoryError):
             # self.revision = get_safe_version(self.repo_id, self.revision)
@@ -608,14 +608,126 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         return fpaths
 
+    def _load_local_parquet_dataset_with_retry(
+        self,
+        *,
+        data_dir: str | None = None,
+        data_files: list[str] | None = None,
+        max_retries: int = 3,
+    ) -> datasets.Dataset:
+        def log_load_message(message: str):
+            try:
+                from tqdm import tqdm
+
+                tqdm.write(message)
+            except Exception:
+                print(message, flush=True)
+
+        class local_fsspec_stat_progress:
+            def __init__(self, total: int | None, desc: str):
+                self.total = total
+                self.desc = desc
+                self.pbar = None
+                self.original_info = None
+                self.seen = set()
+
+            def __enter__(self):
+                try:
+                    from fsspec.implementations.local import LocalFileSystem
+                    from datasets.utils.tqdm import tqdm
+                except Exception:
+                    return self
+
+                self.original_info = LocalFileSystem.info
+                self.pbar = tqdm(
+                    total=self.total,
+                    desc=self.desc,
+                    unit="file",
+                    dynamic_ncols=True,
+                )
+                seen = self.seen
+                pbar = self.pbar
+                original_info = self.original_info
+
+                def wrapped_info(fs_self, path, *args, **kwargs):
+                    out = original_info(fs_self, path, *args, **kwargs)
+                    path_str = str(path)
+                    if path_str.endswith(".parquet") and path_str not in seen:
+                        seen.add(path_str)
+                        pbar.update(1)
+                        pbar.set_postfix(file=Path(path_str).name)
+                    return out
+
+                LocalFileSystem.info = wrapped_info
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                if self.original_info is not None:
+                    from fsspec.implementations.local import LocalFileSystem
+
+                    LocalFileSystem.info = self.original_info
+                if self.pbar is not None:
+                    self.pbar.close()
+
+        last_error = None
+        total_files = len(data_files) if data_files is not None else None
+        for attempt in range(max_retries + 1):
+            try:
+                desc = f"Resolving parquet files attempt {attempt + 1}/{max_retries + 1}"
+                with local_fsspec_stat_progress(total_files, desc):
+                    features = get_hf_features_from_features(self.features)
+                    if data_files is not None:
+                        return load_dataset("parquet", data_files=data_files, split="train", features=features)
+                    return load_dataset("parquet", data_dir=data_dir, split="train", features=features)
+            except FileNotFoundError as exc:
+                last_error = exc
+                message = str(exc)
+                missing_path = None
+                for token in message.split("'")[1::2]:
+                    if token.endswith(".parquet"):
+                        missing_path = token
+                        break
+                if missing_path is None or not Path(missing_path).is_file():
+                    log_load_message(
+                        "[LeRobotDataset] HuggingFace datasets reported a missing parquet file and "
+                        "pathlib could not stat it either. Falling back to the original error/download path. "
+                        f"missing_path={missing_path}"
+                    )
+                    raise
+                if attempt >= max_retries:
+                    log_load_message(
+                        "[LeRobotDataset] HuggingFace datasets repeatedly reported a local parquet file as "
+                        f"missing, but pathlib can stat it: {missing_path}"
+                    )
+                    raise RuntimeError(
+                        "HuggingFace datasets repeatedly reported a local parquet file as missing, "
+                        f"but pathlib can stat it: {missing_path}. This is likely a metadata consistency "
+                        "issue on the mounted filesystem."
+                    ) from last_error
+                sleep_s = min(2.0, 0.5 * (attempt + 1))
+                log_load_message(
+                    "[LeRobotDataset] HuggingFace datasets reported a missing parquet file, but pathlib "
+                    f"can stat it. Treating as mounted-filesystem metadata false negative and retrying "
+                    f"in {sleep_s:.1f}s. attempt={attempt + 1}/{max_retries + 1} path={missing_path}"
+                )
+                __import__("time").sleep(sleep_s)
+            except Exception as exc:
+                log_load_message(
+                    "[LeRobotDataset] Unexpected error while loading local parquet files with "
+                    f"HuggingFace datasets. data_dir={data_dir} num_data_files={total_files} "
+                    f"error={type(exc).__name__}: {exc}"
+                )
+                raise
+        raise last_error
+
     def load_hf_dataset(self) -> datasets.Dataset:
         """hf_dataset contains all the observations, states, actions, rewards, etc."""
         if self.episodes is None:
             path = str(self.root / "data")
-            hf_dataset = load_dataset("parquet", data_dir=path, split="train")
+            hf_dataset = self._load_local_parquet_dataset_with_retry(data_dir=path)
         else:
             files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
-            hf_dataset = load_dataset("parquet", data_files=files, split="train")
+            hf_dataset = self._load_local_parquet_dataset_with_retry(data_files=files)
 
         # TODO(aliberts): hf_dataset.set_format("torch")
         hf_dataset.set_transform(hf_transform_to_torch)

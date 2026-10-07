@@ -24,6 +24,8 @@ train:
   num_frames: 33
   global_sample_stride: 1
   action_video_freq_ratio: 4 # 32 action, 9 video frames
+  include_previous_video_frame: false
+  history_repeat_probability: 0.0
   video_size: [384, 320] # final resize video
   camera_key: null
   val_set_proportion: 0.01
@@ -87,6 +89,8 @@ val:
   num_frames: 33
   global_sample_stride: 1
   action_video_freq_ratio: 4 # 32 action, 9 video frames
+  include_previous_video_frame: false
+  history_repeat_probability: 0.0
   video_size: [384, 320] # final resize video
   camera_key: null
   val_set_proportion: 0.01

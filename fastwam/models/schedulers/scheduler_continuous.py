@@ -52,7 +52,30 @@ class WanContinuousFlowMatchScheduler:
         )
         if sigma.ndim == 0:
             return (1 - sigma) * original_samples + sigma * noise
-        sigma = sigma.view(-1, *([1] * (original_samples.ndim - 1)))
+        if sigma.ndim == 1:
+            if sigma.shape[0] not in (1, original_samples.shape[0]):
+                raise ValueError(
+                    "Batch timestep shape mismatch: "
+                    f"timestep={tuple(timestep.shape)}, samples={tuple(original_samples.shape)}."
+                )
+            sigma = sigma.view(-1, *([1] * (original_samples.ndim - 1)))
+        elif sigma.ndim == 2:
+            if original_samples.ndim < 3 or sigma.shape != (
+                original_samples.shape[0],
+                original_samples.shape[2],
+            ):
+                raise ValueError(
+                    "Per-frame timestep must match samples [B, C, T, ...]: "
+                    f"timestep={tuple(timestep.shape)}, samples={tuple(original_samples.shape)}."
+                )
+            sigma = sigma.view(
+                original_samples.shape[0],
+                1,
+                original_samples.shape[2],
+                *([1] * (original_samples.ndim - 3)),
+            )
+        else:
+            raise ValueError(f"Unsupported timestep shape: {tuple(timestep.shape)}.")
         return (1 - sigma) * original_samples + sigma * noise
 
     @staticmethod

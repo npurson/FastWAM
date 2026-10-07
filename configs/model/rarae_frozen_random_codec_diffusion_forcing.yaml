@@ -1,0 +1,8 @@
+defaults:
+  - rarae@_here_
+  - _self_
+
+# Sample an independent noise timestep for each future frozen-random codec
+# latent. The first latent remains the clean current observation.
+representation:
+  noise_timestep_mode: per_frame

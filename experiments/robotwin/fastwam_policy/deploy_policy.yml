@@ -11,6 +11,10 @@ eval_num_episodes: 100
 sim_cfg_path: null
 sim_task: null
 sim_cfg_name: sim_robotwin.yaml
+# Fully resolved Hydra config produced by eval_robotwin_single.py. This takes
+# precedence over recomposing sim_cfg_path + sim_task so model CLI overrides,
+# including the causal attention mode, survive the RoboTwin subprocess boundary.
+resolved_sim_cfg_path: null
 mixed_precision: bf16
 device: cuda
 dataset_stats_path: null

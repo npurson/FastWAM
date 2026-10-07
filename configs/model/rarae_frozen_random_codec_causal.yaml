@@ -1,0 +1,8 @@
+defaults:
+  - rarae@_here_
+  - _self_
+
+# Causal-attention-only ablation. The codec remains the deterministic frozen
+# random projection and the representation noise timestep is shared.
+representation_dit_config:
+  video_attention_mask_mode: per_frame_causal

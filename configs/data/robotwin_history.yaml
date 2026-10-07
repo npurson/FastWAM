@@ -1,0 +1,13 @@
+defaults:
+  - robotwin@_here_
+  - _self_
+
+# Load images directly at [-ratio, 0, ratio, ..., horizon]. State and action
+# windows remain anchored at step 0.
+train:
+  include_previous_video_frame: true
+  history_repeat_probability: 0.1
+
+val:
+  include_previous_video_frame: true
+  history_repeat_probability: 0.0

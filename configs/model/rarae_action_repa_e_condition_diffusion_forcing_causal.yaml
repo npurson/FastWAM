@@ -1,0 +1,12 @@
+defaults:
+  - rarae_frozen_random_codec_history_diffusion_forcing_causal@_here_
+  - _self_
+
+# C: future codec outputs are detached from the denoising space. The current
+# pair remains connected, so codec receives action gradient and world gradient
+# that reaches the clean current condition through attention.
+representation:
+  codec:
+    type: learnable_random
+    gradient_mode: condition_and_action
+

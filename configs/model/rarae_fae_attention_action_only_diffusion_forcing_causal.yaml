@@ -1,0 +1,21 @@
+defaults:
+  - rarae_action_repa_e_action_only_diffusion_forcing_causal@_here_
+  - _self_
+
+# FAE-inspired codec. Each 2x2x2 DINO block is losslessly patchified to 8192
+# dimensions. Within each temporal pair, 80 front + 20 left-wrist + 20
+# right-wrist tokens jointly use one self-attention layer. Temporal pairs remain
+# independent, and the output retains the existing [B,512,5,12,10] interface.
+representation:
+  codec:
+    type: fae_attention
+    qk_dim: 512
+    num_heads: 8
+    norm_eps: 1.0e-06
+    rope_base: 10000.0
+    position_scale: 16.0
+    # Keep the detached DINO-feature reconstruction head for online RGB
+    # visualization. Its input is stop-gradient, so it cannot shape or confound
+    # the action-trained attention encoder.
+    decoder:
+      enabled: true

@@ -93,6 +93,11 @@ class Wan22Trainer:
         codec_decoder = getattr(self.model, "codec_decoder", None)
         if codec_decoder is not None and bool(getattr(self.model, "codec_decoder_trainable", True)):
             trainable_params.extend(list(codec_decoder.parameters()))
+        representation_codec = getattr(self.model, "representation_codec", None)
+        if representation_codec is not None and bool(
+            getattr(self.model, "representation_codec_trainable", False)
+        ):
+            trainable_params.extend(list(representation_codec.parameters()))
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -388,6 +393,19 @@ class Wan22Trainer:
         if codec_decoder is not None and bool(getattr(model, "codec_decoder_trainable", True)):
             codec_decoder.train()
             codec_decoder.requires_grad_(True)
+        representation_codec = getattr(model, "representation_codec", None)
+        if representation_codec is not None and bool(
+            getattr(model, "representation_codec_trainable", False)
+        ):
+            representation_codec.train()
+            representation_codec.requires_grad_(True)
+        # The top-level model deliberately remains in eval mode so frozen
+        # teachers stay deterministic. Running latent normalization is the one
+        # parameter-free component that still needs train-mode behavior: its
+        # lagged statistics must update for both frozen and trainable codecs.
+        codec_latent_norm = getattr(model, "codec_latent_norm", None)
+        if codec_latent_norm is not None:
+            codec_latent_norm.train()
 
     @staticmethod
     def _to_batched_eval_sample(sample):
@@ -432,8 +450,11 @@ class Wan22Trainer:
                 action = action.unsqueeze(0)
             if action.ndim != 3:
                 raise ValueError(f"`sample['action']` must be 3D [B, T, a_dim], got shape {tuple(action.shape)}")
-            if action.shape[1] % (num_video_frames - 1) != 0:
-                raise ValueError(f"`sample['action']` temporal dimension must be divisible by video frames-1={num_video_frames - 1}, got {action.shape[1]}")
+            # Do not infer action/world alignment from the raw source-video
+            # length here. History-aware datasets prepend a conditioning frame,
+            # and representation models may group/downsample source frames.
+            # The concrete model owns validation against its effective temporal
+            # representation in training_loss()/inference.
             action_horizon = int(action.shape[1])
 
         proprio = None
@@ -661,7 +682,10 @@ class Wan22Trainer:
         video0 = sample["video"][0] # Tensor [3, T, H, W] in (-1, 1)
         action = sample["action"][0] if "action" in sample and sample["action"] is not None else None
         proprio = sample["proprio"][0, 0] if "proprio" in sample and sample["proprio"] is not None else None # from [1, T, d] to [d]
-        input_image = video0[:, 0].unsqueeze(0)
+        uses_history = bool(getattr(model, "representation_codec_uses_history", False))
+        current_image_index = 1 if uses_history else 0
+        input_image = video0[:, current_image_index].unsqueeze(0)
+        previous_image = video0[:, 0].unsqueeze(0) if uses_history else None
         _, num_frames, _, _ = video0.shape
 
         # 2. inference and video saving
@@ -677,6 +701,8 @@ class Wan22Trainer:
             "seed": 42,
             "tiled": False,
         }
+        if previous_image is not None:
+            infer_kwargs["previous_image"] = previous_image
         if sample["context"] is not None:
             infer_kwargs["prompt"] = None
             infer_kwargs["context"] = sample["context"][0]
@@ -686,7 +712,13 @@ class Wan22Trainer:
 
         decoded_gt_video = None
         metric_gt_video = None
-        if getattr(model, "codec_decoder", None) is not None:
+        has_codec_decoder = getattr(model, "has_codec_decoder", None)
+        codec_decoder_available = (
+            bool(has_codec_decoder())
+            if callable(has_codec_decoder)
+            else getattr(model, "codec_decoder", None) is not None
+        )
+        if codec_decoder_available:
             joint_kwargs = dict(infer_kwargs)
             joint_kwargs["num_video_frames"] = joint_kwargs.pop("num_frames")
             joint_kwargs.pop("action_cfg_scale", None)
@@ -839,6 +871,21 @@ class Wan22Trainer:
                     loss, loss_dict = train_model.training_loss(sample)
                 self.accelerator.backward(loss)
 
+                representation_codec = getattr(unwrapped_model, "representation_codec", None)
+                if representation_codec is not None and bool(
+                    getattr(unwrapped_model, "representation_codec_trainable", False)
+                ):
+                    codec_grad_sq = None
+                    for parameter in representation_codec.parameters():
+                        if parameter.grad is None:
+                            continue
+                        value = parameter.grad.detach().float().pow(2).sum()
+                        codec_grad_sq = value if codec_grad_sq is None else codec_grad_sq + value
+                    if codec_grad_sq is not None:
+                        loss_dict["repr/codec_parameter_grad_norm"] = float(
+                            codec_grad_sq.sqrt().item()
+                        )
+
                 if self.accelerator.sync_gradients:
                     grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.optimizer.step()
@@ -933,7 +980,21 @@ class Wan22Trainer:
                                     eval_payload[f"eval/{key}"] = float(metrics[key])
                             self._log_scalars(eval_payload)
                             if "video_tensor" in metrics:
-                                if getattr(unwrapped_model, "codec_decoder", None) is not None:
+                                has_codec_decoder = getattr(
+                                    unwrapped_model,
+                                    "has_codec_decoder",
+                                    None,
+                                )
+                                if (
+                                    bool(has_codec_decoder())
+                                    if callable(has_codec_decoder)
+                                    else getattr(
+                                        unwrapped_model,
+                                        "codec_decoder",
+                                        None,
+                                    )
+                                    is not None
+                                ):
                                     video_tag = "eval/rollout_decoder_gt"
                                 else:
                                     video_tag = "eval/pred_vae_gt" if "psnr_dg" in metrics else "eval/pred_gt"

@@ -203,13 +203,18 @@ def _write_eval_config(
     run_output_dir: Path,
     task_name: str,
     task_config: str,
-) -> None:
+) -> Path:
     task_part = _safe_filename(task_name)
     result_suffix = _result_suffix_from_task_config(task_config)
+    config_path = (
+        run_output_dir / f"eval_config_{task_part}_{result_suffix}.yaml"
+    ).resolve()
+    resolved_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
     OmegaConf.save(
-        config=cfg,
-        f=str(run_output_dir / f"eval_config_{task_part}_{result_suffix}.yaml"),
+        config=resolved_cfg,
+        f=str(config_path),
     )
+    return config_path
 
 
 def _format_override_value(value: Any) -> str:
@@ -257,6 +262,12 @@ def main(cfg: DictConfig):
     task_config = str(cfg.EVALUATION.task_config)
     log_file = _make_log_file(run_output_dir, task_name, task_config)
     robotwin_eval_base = run_output_dir / task_name
+    resolved_sim_cfg_path = _write_eval_config(
+        cfg,
+        run_output_dir,
+        task_name,
+        task_config,
+    )
 
     sim_cfg_path = (PROJECT_ROOT / "configs" / "sim_robotwin.yaml").resolve()
     sim_task = HydraConfig.get().runtime.choices.get("task")
@@ -274,6 +285,7 @@ def main(cfg: DictConfig):
 
     _append_override(overrides, "sim_cfg_path", str(sim_cfg_path))
     _append_override(overrides, "sim_task", sim_task)
+    _append_override(overrides, "resolved_sim_cfg_path", str(resolved_sim_cfg_path))
     _append_override(overrides, "eval_output_dir", str(robotwin_eval_base))
     _append_override(overrides, "mixed_precision", cfg.mixed_precision)
     _append_override(overrides, "device", cfg.EVALUATION.device)
@@ -344,7 +356,6 @@ def main(cfg: DictConfig):
         raise RuntimeError(f"RoboTwin evaluation failed with return code {return_code}. Log: {log_file}")
 
     print(f"Evaluation finished successfully. Log saved to: {log_file}")
-    _write_eval_config(cfg, run_output_dir, task_name, task_config)
 
 
 if __name__ == "__main__":
